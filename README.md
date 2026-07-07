@@ -39,9 +39,9 @@
 
 ## 📝 TODO List
 
-- [x] Release the arXiv paper and project page.
-- [ ] Release the training and sim2sim inference code.
-- [ ] Release the deployment code.
+- [x] Release the arXiv paper and project page in June.
+- [ ] Release the training and sim2sim inference code in August. (🚧 Currently under refactoring)
+- [ ] Release the deployment code in September. (🚧 Currently under refactoring)
 
 
 <!-- ## 📋 Contents
