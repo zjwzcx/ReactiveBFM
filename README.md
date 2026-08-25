@@ -37,27 +37,11 @@
 
 
 
-## 📝 TODO List
-
-- [x] Release the arXiv paper and project page in June.
-- [ ] Release the training and sim2sim inference code in August. (🚧 Currently under refactoring)
-- [ ] Release the deployment code in September. (🚧 Currently under refactoring)
-
-
-<!-- ## 📋 Contents
-
-1. [Installation](#-installation)
-2. [TODO List](#-todo-list)
-3. [Citation](#-citation)
-4. [License](#-license) -->
-
-
-<!-- 
 ## 🛠️ Installation
 
 We test our code under the following environment:
 - Ubuntu 24.04.2 LTS
-- NVIDIA Driver 570.124.04
+- NVIDIA Driver 595.84
 - CUDA 12.8
 - Python 3.12
 
@@ -90,7 +74,16 @@ wandb login
 export WANDB_PROJECT=reactivebfm
 export WANDB_ENTITY=<your_wandb_username>   # optional; omit to use your wandb login default
 ```
- -->
+
+
+
+## 📝 TODO List
+
+- [x] Release the arXiv paper and project page in June.
+- [ ] Release the training and sim2sim inference code in August. (🚧 Currently under refactoring)
+- [ ] Release the deployment code in September. (🚧 Currently under refactoring)
+
+
 
 
 
