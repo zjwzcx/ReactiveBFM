@@ -36,7 +36,6 @@
 </div>
 
 
-
 ## 🛠️ Installation
 
 We test our code under the following environment:
@@ -48,7 +47,7 @@ We test our code under the following environment:
 1. Clone this repository.
 
 ```bash
-git clone https://github.com/zjwzcx/ReactiveBFM
+git clone https://github.com/zjwzcx/ReactiveBFM.git
 cd ReactiveBFM
 ```
 
@@ -63,7 +62,7 @@ conda activate reactivebfm
 
 ```bash
 python -m pip install "setuptools<81" wheel
-python -m pip install --no-build-isolation -r requirement.txt
+python -m pip install --no-build-isolation -r requirements.txt
 python -m spacy download en_core_web_sm
 ```
 
@@ -76,16 +75,71 @@ export WANDB_ENTITY=<your_wandb_username>   # optional; omit to use your wandb l
 ```
 
 
+## Structure
 
-## 📝 TODO List
+```text
+ReactiveBFM/
+├── README.md
+├── pyproject.toml
+├── deploy/            # planned: deployment stack, to be released later
+└── reactivebfm/
+    ├── data/       # datasets, collators, registries, HumanML utilities
+    ├── model/      # DiT motion planner and frozen text encoders
+    ├── utils/      # shared training and runtime utilities
+    ├── train/      # public training entrypoints
+    └── eval/       # planned: evaluation tools, to be released later
+```
 
-- [x] Release the arXiv paper and project page in June.
-- [ ] Release the training and sim2sim inference code in August. (🚧 Currently under refactoring)
-- [ ] Release the deployment code in September. (🚧 Currently under refactoring)
+
+## Data Preparation
+The public recipes use the **36-dimensional G1 motion representation** and
+captioned motion clips. Dataset paths are registered in
+`reactivebfm/data/datasets/registry.py`; multiple registered datasets can be
+combined with a comma-separated `--dataset` argument. Large datasets remain
+outside the repository and are supplied with `--data_dir` when needed.
+
+The complete data contract—frame layout, joint order, coordinate conventions,
+normalization files, split files, and dataset directory examples—is documented
+in [`reactivebfm/data/README.md`](reactivebfm/data/README.md).
 
 
+## Training
+
+The scheduled-forcing entrypoint handles both stages in one run: it uses pure
+teacher forcing for the first 400k steps, then ramps three-primitive
+self-rollout to 1M steps.
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+torchrun --standalone --nnodes=1 --nproc_per_node=8 \
+  -m reactivebfm.train.train_planner_scheduled_forcing \
+  --save_dir save/reactivebfm_tf400k_sr3_1m_bs128x8 \
+  --dataset <reactivebfm_dataset> \
+  --model_type flow \
+  --planner_arch dit \
+  --latent_dim 512 --num_layers 16 --num_heads 8 --dit_ff_size 2048 \
+  --pos_embed_max_len 256 \
+  --lr 1e-4 \
+  --n_primitives 3 --max_replace_prob 0.8 --num_warmup_steps 400000 \
+  --num_steps 1000000 \
+  --batch_size_local 128 --num_workers 8 \
+  --train_platform_type WandBPlatform
+```
+
+Replace `<reactivebfm_dataset>` with the recommended `reactivebfm_dataset`
+name, or customize it with any dataset name or comma-separated composition
+registered in the dataset registry.
+
+For a standalone teacher-forcing baseline, use
+`reactivebfm.train.train_planner_teacher_forcing` with `--num_steps 1000000`.
 
 
+## TODO List
+
+- [x] Release the arXiv paper and project page.
+- [x] Release the training code.
+- [ ] Release the sim2sim evaluation code.
+- [ ] Release the detailed deployment documentation for Unitree G1.
 
 
 ## 🔗 Citation

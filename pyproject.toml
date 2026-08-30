@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "reactivebfm"
+version = "0.1.0"
+description = "ReactiveBFM motion planning package."
+readme = "README.md"
+requires-python = ">=3.10"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["reactivebfm*"]
+
+[tool.setuptools.exclude-package-data]
+"reactivebfm.model.text_encoder" = ["distilbert-base-uncased/*"]

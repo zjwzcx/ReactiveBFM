@@ -1,0 +1,29 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.env
+.venv/
+venv/
+
+build/
+checkpoints/
+/dataset
+reactivebfm/data/datasets/
+# Keep dataset tooling source-controlled while generated assets remain ignored.
+!reactivebfm/data/datasets/
+reactivebfm/data/datasets/*
+!reactivebfm/data/datasets/*.py
+save/
+wandb/
+outputs/
+tmp/
+
+
+assets/
+third_party/
+
+# Local HuggingFace weights used by the frozen text encoder presets.
+reactivebfm/model/text_encoder/distilbert-base-uncased/
+reactivebfm/model/text_encoder/t5-base/
+reactivebfm/model/text_encoder/t5-xl/

@@ -1,0 +1,21 @@
+# Runtime dependencies for the public DiT training recipes.
+# OpenAI CLIP's pinned setup.py imports pkg_resources during metadata build, so
+# install setuptools<81 before this file and use --no-build-isolation.
+
+--extra-index-url https://download.pytorch.org/whl/cu128
+
+torch==2.11.0+cu128
+torchvision==0.26.0+cu128
+torchaudio==2.11.0+cu128
+numpy>=1.26.4,<2.0
+scipy>=1.12,<2.0
+pyyaml>=6,<7
+tqdm>=4.66,<5
+blobfile>=2.1,<4
+transformers>=4.45,<5
+sentencepiece>=0.2,<1
+ftfy>=6.2,<7
+regex>=2024.5,<2027
+huggingface-hub>=0.24,<1
+wandb>=0.17,<1
+clip @ git+https://github.com/openai/CLIP.git@dcba3cb2e2827b402d2701e7e1c7d9fed8a20ef1
