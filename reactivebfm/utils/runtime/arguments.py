@@ -128,9 +128,9 @@ def add_diffusion_options(parser):
 
 def add_model_options(parser):
     group = parser.add_argument_group('model')
-    group.add_argument("--num_layers", default=8, type=int,
+    group.add_argument("--num_layers", default=16, type=int,
                        help="Number of layers.")
-    group.add_argument("--num_heads", default=4, type=int,
+    group.add_argument("--num_heads", default=8, type=int,
                        help="Number of attention heads.")
     group.add_argument("--latent_dim", default=512, type=int,
                        help="Transformer width.")
@@ -146,8 +146,8 @@ def add_model_options(parser):
     )
     group.add_argument("--planner_arch", default="dit", choices=["dit"], type=str,
                        help="Motion planner architecture (the release provides text-conditioned DiT only).")
-    group.add_argument("--dit_ff_size", default=None, type=int,
-                       help="DiT MLP width. Defaults to 4 * latent_dim.")
+    group.add_argument("--dit_ff_size", default=2048, type=int,
+                       help="DiT MLP width.")
     group.add_argument("--dit_dropout", default=0.0, type=float,
                        help="Dropout in DiT attention and MLP branches.")
     group.add_argument("--cond_mask_prob", default=0.1, type=float,
@@ -161,7 +161,7 @@ def add_model_options(parser):
     group.add_argument("--lambda_velocity", default=0.0, type=float, help="Temporal velocity loss (first-order difference).")
     group.add_argument("--lambda_acceleration", default=0.0, type=float, help="Temporal acceleration loss (second-order difference).")
     group.add_argument("--lambda_velocity_prefix", default=0.0, type=float, help="Temporal velocity prefix loss (first-order difference).")
-    group.add_argument("--pos_embed_max_len", default=5000, type=int,
+    group.add_argument("--pos_embed_max_len", default=256, type=int,
                        help="Pose embedding max length.")
     group.add_argument("--use_ema", action=argparse.BooleanOptionalAction, default=True,
                        help="If True, will use EMA model averaging.")
@@ -216,7 +216,7 @@ def add_training_options(parser):
                        help="Path to save checkpoints and results.")
     group.add_argument("--overwrite", action=argparse.BooleanOptionalAction, default=True,
                        help="If True, will enable to use an already existing save_dir.")
-    group.add_argument("--lr", default=2e-4, type=float, help="Learning rate.")
+    group.add_argument("--lr", default=1e-4, type=float, help="Learning rate.")
     group.add_argument("--weight_decay", default=0.0, type=float, help="Optimizer weight decay.")
     group.add_argument(
         "--max_grad_norm",

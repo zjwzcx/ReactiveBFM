@@ -116,13 +116,9 @@ torchrun --standalone --nnodes=1 --nproc_per_node=8 \
   --save_dir save/reactivebfm_tf400k_sr3_1m_bs128x8 \
   --dataset <reactivebfm_dataset> \
   --model_type flow \
-  --planner_arch dit \
-  --latent_dim 512 --num_layers 16 --num_heads 8 --dit_ff_size 2048 \
-  --pos_embed_max_len 256 \
-  --lr 1e-4 \
-  --n_primitives 3 --max_replace_prob 0.8 --num_warmup_steps 400000 \
+  --num_warmup_steps 400000 \
   --num_steps 1000000 \
-  --batch_size_local 128 --num_workers 8 \
+  --batch_size_local 128 \
   --train_platform_type WandBPlatform
 ```
 
@@ -138,8 +134,8 @@ For a standalone teacher-forcing baseline, use
 
 - [x] Release the arXiv paper and project page.
 - [x] Release the training code.
-- [ ] Release the sim2sim evaluation code.
-- [ ] Release the detailed deployment documentation for Unitree G1.
+- [ ] Release all training data in September, 2026.
+- [ ] Release the sim2sim evaluation and deployment code for Unitree G1 in September, 2026.
 
 
 ## 🔗 Citation
@@ -155,6 +151,12 @@ If you find our work helpful, please cite it:
 }
 ```
 
+
+We acknowledge that our work references the code from the following awesome projects.
+
+- [ScaleBFM](https://github.com/zengweishuai/ScaleBFM)
+- [CLoSD](https://github.com/GuyTevet/CLoSD)
+- [HumanML3D](https://github.com/EricGuo5513/HumanML3D)
 
 ## 📄 License
 <a rel="license" href="http://creativecommons.org/licenses/by-nc-sa/4.0/"><img alt="Creative Commons License" style="border-width:0" src="https://i.creativecommons.org/l/by-nc-sa/4.0/80x15.png" /></a>

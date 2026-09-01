@@ -176,10 +176,10 @@ class DiTMotionPlanner(FrozenTextEncoderMixin, nn.Module):
         pose_rep,
         glob,
         glob_rot,
-        latent_dim=256,
-        ff_size=1024,
-        num_layers=8,
-        num_heads=4,
+        latent_dim=512,
+        ff_size=2048,
+        num_layers=16,
+        num_heads=8,
         dropout=0.0,
         ablation=None,
         activation="gelu",
@@ -246,7 +246,7 @@ class DiTMotionPlanner(FrozenTextEncoderMixin, nn.Module):
         self.sequence_pos_encoder = PositionalEncoding(
             self.latent_dim,
             self.dropout,
-            max_len=kargs.get("pos_embed_max_len", 5000),
+            max_len=kargs.get("pos_embed_max_len", 256),
         )
         self.embed_timestep = TimestepEmbedder(
             self.latent_dim, self.sequence_pos_encoder
