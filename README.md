@@ -1,6 +1,7 @@
 <p align="center">
 <h1 align="center"><strong>ReactiveBFM: Reactive Closed-Loop Motion Planning Towards Universal Humanoid Whole-Body Control</strong></h1>
   <p align="center">
+    <strong>CoRL 2026</strong><br>
     <a href='https://xiao-chen.tech/' target='_blank'>Xiao Chen</a><sup>1,2</sup>&emsp;
     <a href='https://zengweishuai.github.io/' target='_blank'>Weishuai Zeng</a><sup>2*</sup>&emsp;
     <a href='https://scholar.google.com/citations?user=R42aU6gAAAAJ&hl=en' target='_blank'>Xiaojie Niu</a><sup>2*</sup>&emsp;
@@ -132,8 +133,8 @@ For a standalone teacher-forcing baseline, use
 
 ## TODO List
 
-- [x] Release the arXiv paper and project page.
-- [x] Release the training code.
+- [x] Release the arXiv paper and project page in June, 2026.
+- [x] Release the training code in August, 2026.
 - [ ] Release all training data in September, 2026.
 - [ ] Release the sim2sim evaluation and deployment code for Unitree G1 in September, 2026.
 
