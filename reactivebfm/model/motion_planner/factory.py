@@ -9,16 +9,10 @@ from reactivebfm.utils.runtime.defaults import (
 from .architectures import DiTMotionPlanner
 from .objectives.diffusion import gaussian_diffusion as gd
 from .objectives.diffusion.respace import (
-    SpacedDiffusion,
     SpacedDiffusionSmoothStandard,
     space_timesteps,
 )
 from .objectives.flow import FlowMatchingSmoothStandard
-
-
-def create_model_and_diffusion(args, data):
-    """Build the configured planner and legacy diffusion objective."""
-    return create_motion_planner_model(args, data), create_gaussian_diffusion(args)
 
 
 def create_model_and_diffusion_smooth(args, data=None):
@@ -91,6 +85,10 @@ def get_model_args(args, data=None):
         "num_heads": args.num_heads,
         "dropout": dropout,
         "activation": "gelu",
+        "dit_role_embedding": getattr(args, "dit_role_embedding", False),
+        "dit_rtc_time_cache": getattr(args, "dit_rtc_time_cache", False),
+        "dit_rope": getattr(args, "dit_rope", False),
+        "dit_text_kv_cache": getattr(args, "dit_text_kv_cache", False),
         "data_rep": data_rep,
         "cond_mode": "text",
         "cond_mask_prob": args.cond_mask_prob,
@@ -102,42 +100,6 @@ def get_model_args(args, data=None):
         "pred_len": args.pred_len,
         "context_len": args.context_len,
     }
-
-
-def create_gaussian_diffusion(args):
-    """Build the legacy Gaussian diffusion objective."""
-    predict_xstart = True
-    steps = args.denoise_steps
-    timestep_respacing = ""
-    learn_sigma = False
-    rescale_timesteps = False
-
-    betas = gd.get_named_beta_schedule(args.noise_schedule, steps, scale_betas=1.0)
-    loss_type = gd.LossType.MSE
-    if not timestep_respacing:
-        timestep_respacing = [steps]
-
-    return SpacedDiffusion(
-        use_timesteps=space_timesteps(steps, timestep_respacing),
-        betas=betas,
-        model_mean_type=(
-            gd.ModelMeanType.START_X if predict_xstart else gd.ModelMeanType.EPSILON
-        ),
-        model_var_type=(
-            (
-                gd.ModelVarType.FIXED_SMALL
-                if args.sigma_small
-                else gd.ModelVarType.FIXED_LARGE
-            )
-            if not learn_sigma
-            else gd.ModelVarType.LEARNED_RANGE
-        ),
-        loss_type=loss_type,
-        rescale_timesteps=rescale_timesteps,
-        lambda_vel=args.lambda_vel,
-        lambda_rcxyz=args.lambda_rcxyz,
-        lambda_fc=args.lambda_fc,
-    )
 
 
 def create_gaussian_diffusion_smooth(args):
@@ -203,9 +165,7 @@ def _validate_standard_losses(args, objective_name, base_loss_name):
 
 __all__ = [
     "create_flow_matching_smooth",
-    "create_gaussian_diffusion",
     "create_gaussian_diffusion_smooth",
-    "create_model_and_diffusion",
     "create_model_and_diffusion_smooth",
     "create_motion_planner_model",
     "get_model_args",

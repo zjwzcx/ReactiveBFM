@@ -117,8 +117,46 @@ class GaussianDiffusionSmooth(GaussianDiffusion):
             / (1.0 - self.alphas_cumprod)
         )
 
-        # self.l2_loss = lambda a, b: (a - b) ** 2  # th.nn.MSELoss(reduction='none')  # must be None for handling mask later on.
         self.masked_l2 = masked_l2
+
+    @staticmethod
+    def _apply_training_rtc(x_start, x_t, model_kwargs, loss_mask):
+        """Keep a random clean action prefix and exclude it from the loss."""
+        rtc_delay = model_kwargs.get("y", {}).get("rtc_delay")
+        if rtc_delay is None:
+            model_kwargs["y"].pop("loss_mask", None)
+            return x_t, model_kwargs["y"]["mask"], None, None
+        rtc_delay = rtc_delay.to(device=x_start.device, dtype=torch.long).reshape(-1)
+        batch_size, action_length = x_start.shape[0], x_start.shape[-1]
+        if rtc_delay.shape[0] != batch_size:
+            raise ValueError(
+                f"rtc_delay must have shape [B], got {tuple(rtc_delay.shape)}"
+            )
+        if torch.any(rtc_delay < 0) or torch.any(rtc_delay > action_length):
+            raise ValueError(
+                f"rtc_delay must be in [0, {action_length}], got "
+                f"min={int(rtc_delay.min())}, max={int(rtc_delay.max())}"
+            )
+        frame_ids = torch.arange(action_length, device=x_start.device).view(1, -1)
+        rtc_prefix = frame_ids < rtc_delay[:, None]
+        prefix_noise_std = float(
+            model_kwargs["y"].get("rtc_prefix_noise_std", 0.0)
+        )
+        if prefix_noise_std < 0.0:
+            raise ValueError(
+                "rtc_prefix_noise_std must be non-negative; "
+                f"got {prefix_noise_std}."
+            )
+        committed_prefix = x_start
+        if prefix_noise_std > 0.0:
+            prefix_noise = torch.randn_like(x_start[..., :1]) * prefix_noise_std
+            committed_prefix = committed_prefix + prefix_noise
+        x_t = torch.where(
+            rtc_prefix[:, None, None, :], committed_prefix, x_t
+        )
+        loss_mask = loss_mask & ~rtc_prefix[:, None, None, :]
+        model_kwargs["y"]["loss_mask"] = loss_mask
+        return x_t, loss_mask, rtc_prefix, rtc_delay
 
     def training_losses(self, model, x_start, t, model_kwargs=None, noise=None, dataset=None, return_model_output=False):
         """
@@ -149,6 +187,10 @@ class GaussianDiffusionSmooth(GaussianDiffusion):
 
         # NOTE: add noise to x_start (gt_predicted_motion)
         x_t = self.q_sample(x_start, t, noise=noise, model_kwargs=model_kwargs) # [bs, njoints, nfeats, pred_len]
+        x_t, loss_mask, rtc_prefix, rtc_delay = self._apply_training_rtc(
+            x_start, x_t, model_kwargs, loss_mask
+        )
+
         terms = {}
 
         if self.loss_type == LossType.KL or self.loss_type == LossType.RESCALED_KL:
@@ -211,11 +253,17 @@ class GaussianDiffusionSmooth(GaussianDiffusion):
                 assert self.model_mean_type == ModelMeanType.START_X, 'Velocity loss supports only X_start prediction for now!'
                 # Compute predicted velocity: model_output[t+1] - model_output[t]
                 smooth_prediction = model_output
+                if rtc_prefix is not None:
+                    smooth_prediction = torch.where(
+                        rtc_prefix[:, None, None, :], x_start, smooth_prediction
+                    )
                 pred_velocity = smooth_prediction[:, :, :, 1:] - smooth_prediction[:, :, :, :-1]  # [bs, njoints, 1, seqlen-1]
                 velocity_gt = model_kwargs['y']['velocity_gt']  # [bs, njoints, 1, seqlen-1]
                 velocity_mask = model_kwargs['y'].get(
                     'velocity_loss_mask',
                     model_kwargs['y']['velocity_mask'])  # [bs, 1, 1, seqlen-1]
+                if rtc_prefix is not None:
+                    velocity_mask = velocity_mask & ~rtc_prefix[:, None, None, 1:]
                 terms["velocity_loss"] = self.masked_l2(
                     pred_velocity, velocity_gt, velocity_mask,
                     entries_norm=(velocity_mask.shape[1] == 1))
@@ -226,6 +274,10 @@ class GaussianDiffusionSmooth(GaussianDiffusion):
                 # Compute predicted velocity first (reuse if already computed above)
                 if pred_velocity is None:
                     smooth_prediction = model_output
+                    if rtc_prefix is not None:
+                        smooth_prediction = torch.where(
+                            rtc_prefix[:, None, None, :], x_start, smooth_prediction
+                        )
                     pred_velocity = smooth_prediction[:, :, :, 1:] - smooth_prediction[:, :, :, :-1]  # [bs, njoints, 1, seqlen-1]
                 # Then compute predicted acceleration: pred_velocity[t+1] - pred_velocity[t]
                 pred_acceleration = pred_velocity[:, :, :, 1:] - pred_velocity[:, :, :, :-1]  # [bs, njoints, 1, seqlen-2]
@@ -233,6 +285,8 @@ class GaussianDiffusionSmooth(GaussianDiffusion):
                 acceleration_mask = model_kwargs['y'].get(
                     'acceleration_loss_mask',
                     model_kwargs['y']['acceleration_mask'])  # [bs, 1, 1, seqlen-2]
+                if rtc_prefix is not None:
+                    acceleration_mask = acceleration_mask & ~rtc_prefix[:, None, None, 2:]
                 terms["acceleration_loss"] = self.masked_l2(
                     pred_acceleration, acceleration_gt, acceleration_mask,
                     entries_norm=(acceleration_mask.shape[1] == 1))
@@ -249,6 +303,8 @@ class GaussianDiffusionSmooth(GaussianDiffusion):
                 prefix_velocity_mask = model_kwargs['y'].get(
                     'prefix_velocity_loss_mask',
                     mask[:, :, :, 0:1])  # [bs, 1, 1, 1]
+                if rtc_prefix is not None:
+                    prefix_velocity_mask = prefix_velocity_mask & ~rtc_prefix[:, None, None, 0:1]
                 terms["velocity_prefix_loss"] = self.masked_l2(
                     pred_velocity_prefix, gt_velocity_prefix, prefix_velocity_mask,
                     entries_norm=(prefix_velocity_mask.shape[1] == 1))
@@ -267,6 +323,8 @@ class GaussianDiffusionSmooth(GaussianDiffusion):
         else:
             raise NotImplementedError(self.loss_type)
 
+        if rtc_delay is not None:
+            terms['diffusion/rtc_delay'] = rtc_delay.float().detach()
         return terms
 
 
@@ -285,6 +343,9 @@ class GaussianDiffusionSmoothStandard(GaussianDiffusionSmooth):
             noise = th.randn_like(x_start)
 
         x_t = self.q_sample(x_start, t, noise=noise, model_kwargs=model_kwargs)
+        x_t, loss_mask, rtc_prefix, rtc_delay = self._apply_training_rtc(
+            x_start, x_t, model_kwargs, loss_mask
+        )
         terms = {}
 
         if self.loss_type == LossType.KL or self.loss_type == LossType.RESCALED_KL:
@@ -336,11 +397,17 @@ class GaussianDiffusionSmoothStandard(GaussianDiffusionSmooth):
             if 'velocity_gt' in model_kwargs['y']:
                 assert self.model_mean_type == ModelMeanType.START_X
                 smooth_prediction = model_output
+                if rtc_prefix is not None:
+                    smooth_prediction = torch.where(
+                        rtc_prefix[:, None, None, :], x_start, smooth_prediction
+                    )
                 pred_velocity = smooth_prediction[:, :, :, 1:] - smooth_prediction[:, :, :, :-1]
                 velocity_mask = model_kwargs['y'].get(
                     'velocity_loss_mask',
                     model_kwargs['y']['velocity_mask'],
                 )
+                if rtc_prefix is not None:
+                    velocity_mask = velocity_mask & ~rtc_prefix[:, None, None, 1:]
                 terms["velocity_loss"] = self.masked_l2(
                     pred_velocity,
                     model_kwargs['y']['velocity_gt'],
@@ -352,12 +419,18 @@ class GaussianDiffusionSmoothStandard(GaussianDiffusionSmooth):
                 assert self.model_mean_type == ModelMeanType.START_X
                 if pred_velocity is None:
                     smooth_prediction = model_output
+                    if rtc_prefix is not None:
+                        smooth_prediction = torch.where(
+                            rtc_prefix[:, None, None, :], x_start, smooth_prediction
+                        )
                     pred_velocity = smooth_prediction[:, :, :, 1:] - smooth_prediction[:, :, :, :-1]
                 pred_acceleration = pred_velocity[:, :, :, 1:] - pred_velocity[:, :, :, :-1]
                 acceleration_mask = model_kwargs['y'].get(
                     'acceleration_loss_mask',
                     model_kwargs['y']['acceleration_mask'],
                 )
+                if rtc_prefix is not None:
+                    acceleration_mask = acceleration_mask & ~rtc_prefix[:, None, None, 2:]
                 terms["acceleration_loss"] = self.masked_l2(
                     pred_acceleration,
                     model_kwargs['y']['acceleration_gt'],
@@ -374,6 +447,8 @@ class GaussianDiffusionSmoothStandard(GaussianDiffusionSmooth):
                     'prefix_velocity_loss_mask',
                     mask[:, :, :, 0:1],
                 )
+                if rtc_prefix is not None:
+                    prefix_velocity_mask = prefix_velocity_mask & ~rtc_prefix[:, None, None, 0:1]
                 terms["velocity_prefix_loss"] = self.masked_l2(
                     pred_velocity_prefix,
                     gt_velocity_prefix,
@@ -402,4 +477,6 @@ class GaussianDiffusionSmoothStandard(GaussianDiffusionSmooth):
         else:
             raise NotImplementedError(self.loss_type)
 
+        if rtc_delay is not None:
+            terms['diffusion/rtc_delay'] = rtc_delay.float().detach()
         return terms

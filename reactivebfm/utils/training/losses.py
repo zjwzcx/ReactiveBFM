@@ -1,4 +1,4 @@
-from reactivebfm.model.motion_planner.objectives.diffusion.nn import mean_flat, sum_flat
+from reactivebfm.model.motion_planner.objectives.diffusion.nn import sum_flat
 import torch
 
 

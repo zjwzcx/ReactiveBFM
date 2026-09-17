@@ -3,8 +3,6 @@ import copy
 import functools
 import os
 import warnings
-from types import SimpleNamespace
-import numpy as np
 import math
 import re
 from os.path import join as pjoin
@@ -21,11 +19,9 @@ from reactivebfm.model.motion_planner.objectives.diffusion.fp16_util import (
 )
 from reactivebfm.model.motion_planner.objectives.diffusion.resample import (
     LossAwareSampler,
-    UniformSampler,
     create_named_schedule_sampler,
 )
 from tqdm import tqdm
-from reactivebfm.data.datasets import lengths_to_mask
 from reactivebfm.utils.training.models import load_model_wo_clip
 from reactivebfm.data.motion import HML_ROOT_HORIZONTAL_MASK
 
@@ -67,12 +63,12 @@ class TeacherForcingLoop:
         self.data = data
         self.batch_size_local = args.batch_size_local
         self.batch_size_global = args.batch_size_global
-        self.microbatch = self.batch_size_local  # deprecating this option
+        self.microbatch = self.batch_size_local
         self.lr = args.lr
         self.log_interval = args.log_interval
         self.save_interval = args.save_interval
         self.resume_checkpoint = args.resume_checkpoint
-        self.use_fp16 = False  # deprecating this option
+        self.use_fp16 = False
         bf16_requested = bool(getattr(args, 'use_bf16', False))
         bf16_supported = (
             torch.cuda.is_available()
@@ -82,9 +78,24 @@ class TeacherForcingLoop:
         self.use_bf16 = bf16_requested and bf16_supported
         if bf16_requested and not self.use_bf16:
             logger.log("[bf16] Requested but not supported on this GPU/runtime; falling back to fp32.")
-        self.fp16_scale_growth = 1e-3  # deprecating this option
+        self.fp16_scale_growth = 1e-3
         self.weight_decay = args.weight_decay
         self.lr_anneal_steps = args.lr_anneal_steps
+        self.training_rtc = bool(getattr(args, 'training_rtc', True))
+        self.rtc_max_delay = int(getattr(args, 'rtc_max_delay', 6))
+        self.rtc_prefix_noise_std = float(
+            getattr(args, 'rtc_prefix_noise_std', 0.0)
+        )
+        if self.training_rtc and not 0 <= self.rtc_max_delay < int(args.pred_len):
+            raise ValueError(
+                "training-time RTC requires 0 <= rtc_max_delay < pred_len; "
+                f"got rtc_max_delay={self.rtc_max_delay}, pred_len={args.pred_len}."
+            )
+        if self.rtc_prefix_noise_std < 0.0:
+            raise ValueError(
+                "rtc_prefix_noise_std must be non-negative, "
+                f"got {self.rtc_prefix_noise_std}."
+            )
         self.step = 0
         self.resume_step = 0
         self.global_batch = self.batch_size_global
@@ -180,7 +191,7 @@ class TeacherForcingLoop:
                 load_model_wo_clip(self.model, state_dict)
                 if self.args.use_ema:
                     print('loading model_avg from model')
-                    self.model_avg.load_state_dict(self.model.state_dict(), strict=False)
+                    self.model_avg.load_state_dict(self.model.state_dict(), strict=True)
         elif getattr(self.args, 'finetune_from', ''):
             ckpt_path = self.args.finetune_from
             logger.log(f"[Fine-tune] Loading pretrained weights: {ckpt_path}")
@@ -195,7 +206,7 @@ class TeacherForcingLoop:
                 load_model_wo_clip(self.model, state_dict)
                 if self.args.use_ema:
                     self.model_avg.load_state_dict(
-                        self.model.state_dict(), strict=False)
+                        self.model.state_dict(), strict=True)
 
         dist_util.sync_params(self.model.parameters())
         dist_util.sync_params(self.model.buffers())
@@ -314,6 +325,11 @@ class TeacherForcingLoop:
         is_main_process = dist_util.is_main_process()
         if is_main_process:
             print('train steps:', self.num_steps)
+            if self.training_rtc:
+                print(
+                    f'[Training RTC] enabled, uniform delay in '
+                    f'[0, {self.rtc_max_delay}] action frames'
+                )
         for epoch in range(self.num_epochs):
             if hasattr(self.data.sampler, 'set_epoch'):
                 self.data.sampler.set_epoch(epoch)
@@ -356,9 +372,6 @@ class TeacherForcingLoop:
                     dist_util.barrier()
                     if is_main_process:
                         self.save()
-                        self.model.eval()
-                        self.generate_during_training()
-                        self.model.train()
                     dist_util.barrier()
 
                     # Run for a finite amount of time in integration tests.
@@ -410,13 +423,15 @@ class TeacherForcingLoop:
             assert self.microbatch == self.batch_size_local
             micro_batch = batch
             micro_cond = cond
-            # # TODO: debug
-            # debug_text = "a person bounces on the balls of their feet and performs a couple of jabs with a closed fist and then practices protecting their side and head from punches."
-            # if debug_text in micro_cond['y']['text']:
-            #     print(f'Debug text found in micro_cond: {debug_text}')
-            #     text_idx = micro_cond['y']['text'].index(debug_text)
-            #     print(f'Text index: {text_idx}')
-
+            if self.training_rtc:
+                micro_cond['y']['rtc_delay'] = torch.randint(
+                    0,
+                    self.rtc_max_delay + 1,
+                    (micro_batch.shape[0],),
+                    device=micro_batch.device,
+                    dtype=torch.long,
+                )
+                micro_cond['y']['rtc_prefix_noise_std'] = self.rtc_prefix_noise_std
             last_batch = (i + self.microbatch) >= batch.shape[0]
             t, weights = self.schedule_sampler.sample(micro_batch.shape[0], dist_util.dev())    # diffusion steps
 
@@ -488,23 +503,7 @@ class TeacherForcingLoop:
     def ckpt_file_name(self):
         return f"model{(self.total_step()):09d}.pt"
 
-    def generate_during_training(self):
-        if not self.args.gen_during_training:
-            return
-        raise NotImplementedError(
-            "gen_during_training needs a standard sampler; the legacy sampler was removed."
-        )
-
-    
     def find_resume_checkpoint(self) -> Optional[str]:
-        '''look for all file in save directory in the pattent of model{number}.pt
-            and return the one with the highest step number.
-
-        Kept as a compatibility hook for older checkpoints.
-        TODO: Change call for find_resume_checkpoint and send save_dir as arg.
-        TODO: This means ignoring the flag of resume_checkpoint in case some other ckpts exists in that dir!
-        '''
-
         matches = {file: re.match(r'model(\d+).pt$', file) for file in os.listdir(self.args.save_dir)}
         models = {int(match.group(1)): file for file, match in matches.items() if match}
 

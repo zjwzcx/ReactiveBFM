@@ -82,7 +82,6 @@ def gaussian_filter1d(sigma, order=0, truncate=4.0):
     # Since we are calling correlate, not convolve, revert the kernel
     weights = _gaussian_kernel1d(sigma, order, lw)[::-1]
     return weights
-    # return correlate1d(input, weights, axis, output, mode, cval, 0)
 
 def gaussian_filter1d_torch(sigma, order=0, truncate=4.0):
     # [1, 1, kernel_size]

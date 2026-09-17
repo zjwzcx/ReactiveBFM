@@ -40,14 +40,10 @@ Primitive layout for context_len=C, pred_len=P, n_primitives=N:
 
 import contextlib
 import copy
-import functools
-import hashlib
 import json
 import os
 import random as pyrandom
 import warnings
-from types import SimpleNamespace
-import numpy as np
 
 import re
 from os.path import join as pjoin
@@ -55,7 +51,6 @@ from typing import Optional
 
 import blobfile as bf
 import torch
-import torch.distributed as dist
 from torch.optim import AdamW
 
 from reactivebfm.model.motion_planner.objectives.diffusion import logger
@@ -63,22 +58,16 @@ from reactivebfm.utils.runtime import distributed as dist_util
 from reactivebfm.model.motion_planner.objectives.diffusion.fp16_util import (
     MixedPrecisionTrainer,
 )
-from reactivebfm.model.motion_planner.objectives.diffusion.resample import (
-    LossAwareSampler,
-    UniformSampler,
-    create_named_schedule_sampler,
-)
+from reactivebfm.model.motion_planner.objectives.diffusion.resample import create_named_schedule_sampler
 from tqdm import tqdm
-from reactivebfm.data.datasets import lengths_to_mask
 from reactivebfm.utils.training.models import load_model_wo_clip
 from reactivebfm.data.motion import HML_ROOT_HORIZONTAL_MASK
-from reactivebfm.utils.training.losses import masked_motion_metrics
 
 INITIAL_LOG_LOSS_SCALE = 20.0
 
 
 class ScheduledForcingLoop:
-    def __init__(self, args, train_platform, model, diffusion, data, eval_loaders=None):
+    def __init__(self, args, train_platform, model, diffusion, data):
         self.args = args
         self.train_platform = train_platform
         self.model = model
@@ -88,7 +77,6 @@ class ScheduledForcingLoop:
         self.diffusion = diffusion
         self.cond_mode = model.cond_mode
         self.data = data
-        self.eval_loaders = dict(eval_loaders or {})
         self.batch_size_local = int(args.batch_size_local)
         self.batch_size_global = int(args.batch_size_global)
         self.microbatch = self.batch_size_local
@@ -113,6 +101,21 @@ class ScheduledForcingLoop:
         self.n_primitives = args.n_primitives
         self.context_len = args.context_len
         self.pred_len = args.pred_len
+        self.training_rtc = bool(getattr(args, 'training_rtc', True))
+        self.rtc_max_delay = int(getattr(args, 'rtc_max_delay', 6))
+        self.rtc_prefix_noise_std = float(
+            getattr(args, 'rtc_prefix_noise_std', 0.0)
+        )
+        if self.training_rtc and not 0 <= self.rtc_max_delay < self.pred_len:
+            raise ValueError(
+                "training-time RTC requires 0 <= rtc_max_delay < pred_len; "
+                f"got rtc_max_delay={self.rtc_max_delay}, pred_len={self.pred_len}."
+            )
+        if self.rtc_prefix_noise_std < 0.0:
+            raise ValueError(
+                "rtc_prefix_noise_std must be non-negative, "
+                f"got {self.rtc_prefix_noise_std}."
+            )
         self.max_replace_prob = args.max_replace_prob
         self.num_warmup_steps = max(
             0, getattr(args, 'num_warmup_steps', 0))
@@ -125,6 +128,12 @@ class ScheduledForcingLoop:
             )
         self.use_continuous_rollout = self.self_rollout_mode == 'continuous'
         self.cross_prob = getattr(args, 'cross_prob', 0.0)
+        if not 0.0 <= float(self.cross_prob) <= 1.0:
+            raise ValueError(f"cross_prob must be in [0, 1], got {self.cross_prob}.")
+        if self.cross_prob > 0.0 and self.n_primitives < 2:
+            raise ValueError(
+                "cross_prob > 0 requires n_primitives >= 2 so a transition point exists."
+            )
         if self.use_continuous_rollout and self.cross_prob > 0.0:
             raise ValueError(
                 "cross_prob is not supported in continuous self-rollout mode; "
@@ -134,19 +143,6 @@ class ScheduledForcingLoop:
         self.resume_step = 0
         self.global_batch = self.batch_size_global
         self.num_steps = args.num_steps
-        self.val_eval_interval = int(getattr(args, 'val_eval_interval', 0) or 0)
-        self.test_eval_interval = int(getattr(args, 'test_eval_interval', 0) or 0)
-        self.eval_seed = int(getattr(args, 'eval_seed', 12345))
-        self.eval_primary_metric = str(
-            getattr(args, 'eval_primary_metric', 'auto') or 'auto'
-        )
-        if self.eval_primary_metric == 'auto':
-            self.eval_primary_metric = (
-                'tmr_r_at_3' if getattr(args, 'g1_tmr_checkpoint', '') else 'mse'
-            )
-        self.best_val_score = (
-            float('-inf') if self.eval_primary_metric == 'tmr_r_at_3' else float('inf')
-        )
         self.self_rollout_ramp_steps = max(
             self.num_steps - self.num_warmup_steps, 1)
         dataset_len = len(self.data.dataset) if hasattr(self.data, 'dataset') else len(self.data)
@@ -168,7 +164,6 @@ class ScheduledForcingLoop:
         self.sync_cuda = torch.cuda.is_available()
 
         self._load_and_sync_parameters()
-        self._load_best_metrics()
         self.mp_trainer = MixedPrecisionTrainer(
             model=self.model,
             use_fp16=self.use_fp16,
@@ -212,11 +207,6 @@ class ScheduledForcingLoop:
         if torch.cuda.is_available() and dist_util.dev() != 'cpu':
             self.device = torch.device(dist_util.dev())
 
-        self.use_motion_tokenizer_latent = False
-
-        # Held-out evaluators are intentionally outside the public baseline.
-        self.g1_tmr_evaluator = None
-
         self.schedule_sampler_type = 'uniform'
         self.schedule_sampler = create_named_schedule_sampler(self.schedule_sampler_type, diffusion)
 
@@ -232,117 +222,6 @@ class ScheduledForcingLoop:
                 ),
                 gradient_as_bucket_view=True,
             )
-
-    def _setup_motion_tokenizer(self):
-        ckpt_path = getattr(self.args, 'motion_tokenizer_ckpt', '')
-        if not ckpt_path:
-            raise ValueError("motion_tokenizer_ckpt is required for tokenizer latent training.")
-        ckpt = torch.load(ckpt_path, map_location='cpu')
-        cfg = tokenizer_config_from_payload(ckpt['cfg'])
-        tokenizer = ReactiveMotionVQVAE(cfg).to(self.device)
-        tokenizer.load_state_dict(ckpt['model'], strict=True)
-        tokenizer.eval()
-        for param in tokenizer.parameters():
-            param.requires_grad_(False)
-        self.motion_tokenizer = tokenizer
-        self.motion_tokenizer_frames_per_token = int(tokenizer.frames_per_token)
-        expected = int(getattr(self.args, 'motion_tokenizer_frames_per_token', self.motion_tokenizer_frames_per_token))
-        if expected != self.motion_tokenizer_frames_per_token:
-            raise ValueError(
-                f"Tokenizer frames_per_token mismatch: args={expected}, checkpoint={self.motion_tokenizer_frames_per_token}"
-            )
-        self._setup_motion_latent_normalization()
-        logger.log(
-            f"[Tokenizer Latent] Loaded frozen tokenizer from {ckpt_path}; "
-            f"frames_per_token={self.motion_tokenizer_frames_per_token}, code_dim={cfg.code_dim}, "
-            f"latent_norm={getattr(self.args, 'motion_tokenizer_latent_norm', 'codebook')}, "
-            f"decode_quantize={self.motion_tokenizer_decode_quantize}"
-        )
-
-    def _setup_motion_latent_normalization(self):
-        mode = getattr(self.args, 'motion_tokenizer_latent_norm', 'codebook')
-        if mode == 'none':
-            self.motion_latent_mean = None
-            self.motion_latent_std = None
-            return
-        if mode != 'codebook':
-            raise ValueError(f"Unknown motion_tokenizer_latent_norm={mode}")
-        embed = self.motion_tokenizer.quantizer.embed.detach().float()
-        mean = embed.mean(dim=1).reshape(1, -1, 1, 1)
-        std = embed.std(dim=1).reshape(1, -1, 1, 1).clamp_min(1.0e-6)
-        self.motion_latent_mean = mean.to(self.device)
-        self.motion_latent_std = std.to(self.device)
-        logger.log(
-            f"[Tokenizer Latent] codebook normalization: mean_abs={mean.abs().mean().item():.4f}, "
-            f"std_mean={std.mean().item():.4f}, std_min={std.min().item():.4f}, std_max={std.max().item():.4f}"
-        )
-
-    def _normalize_motion_latents(self, latent_motion):
-        if self.motion_latent_mean is None or self.motion_latent_std is None:
-            return latent_motion
-        mean = self.motion_latent_mean.to(device=latent_motion.device, dtype=latent_motion.dtype)
-        std = self.motion_latent_std.to(device=latent_motion.device, dtype=latent_motion.dtype)
-        return (latent_motion - mean) / std
-
-    def _denormalize_motion_latents(self, latent_motion):
-        if self.motion_latent_mean is None or self.motion_latent_std is None:
-            return latent_motion
-        mean = self.motion_latent_mean.to(device=latent_motion.device, dtype=latent_motion.dtype)
-        std = self.motion_latent_std.to(device=latent_motion.device, dtype=latent_motion.dtype)
-        return latent_motion * std + mean
-
-    @torch.no_grad()
-    def _quantize_motion_latents(self, latent_motion):
-        q, _indices, _commit, _perplexity = self.motion_tokenizer.quantizer(latent_motion.squeeze(2))
-        return q.unsqueeze(2)
-
-    @torch.no_grad()
-    def _encode_motion_latents(self, motion_full):
-        if self.motion_tokenizer is None:
-            return motion_full
-        if motion_full.ndim != 4 or motion_full.shape[2] != 1:
-            raise ValueError(f"Expected raw motion shape [B,D,1,T], got {tuple(motion_full.shape)}")
-        motion_seq = motion_full.squeeze(2).transpose(1, 2).contiguous()
-        z = self.motion_tokenizer.encoder(motion_seq)
-        q, _indices, _commit, _perplexity = self.motion_tokenizer.quantizer(z)
-        q = q.detach().unsqueeze(2)
-        return self._normalize_motion_latents(q)
-
-    @torch.no_grad()
-    def _decode_motion_latents(self, latent_motion, target_len=None):
-        if self.motion_tokenizer is None:
-            return latent_motion
-        if latent_motion.ndim != 4 or latent_motion.shape[2] != 1:
-            raise ValueError(f"Expected latent motion shape [B,C,1,T], got {tuple(latent_motion.shape)}")
-        if target_len is None:
-            target_len = latent_motion.shape[-1] * self.motion_tokenizer_frames_per_token
-        latent_motion = self._denormalize_motion_latents(latent_motion)
-        if self.motion_tokenizer_decode_quantize:
-            latent_motion = self._quantize_motion_latents(latent_motion)
-        decoded = self.motion_tokenizer.decoder(latent_motion.squeeze(2), int(target_len))
-        return decoded.transpose(1, 2).unsqueeze(2).contiguous()
-
-    @torch.no_grad()
-    def _decoded_raw_motion_metrics(self, pred_latent, gt_raw, raw_mask, prefix_latent=None):
-        prefix_raw = None
-        if prefix_latent is not None:
-            # Match inference/generation: decode prefix+prediction together, then crop the
-            # prediction frames. The temporal decoder is convolutional, so decoding the
-            # prediction chunk alone gives a pessimistic and inconsistent metric.
-            full_latent = torch.cat([prefix_latent, pred_latent], dim=-1)
-            full_raw = self._decode_motion_latents(
-                full_latent,
-                target_len=self.motion_raw_context_len + gt_raw.shape[-1],
-            )
-            prefix_raw = full_raw[..., :self.motion_raw_context_len]
-            pred_raw = full_raw[..., self.motion_raw_context_len:self.motion_raw_context_len + gt_raw.shape[-1]]
-        else:
-            pred_raw = self._decode_motion_latents(pred_latent, target_len=gt_raw.shape[-1])
-        return masked_motion_metrics(pred_raw, gt_raw, raw_mask, prefix=prefix_raw)
-
-    def _latent_lengths(self, raw_lengths, max_latent_len):
-        lengths = torch.div(raw_lengths, self.motion_tokenizer_frames_per_token, rounding_mode='floor')
-        return lengths.clamp(min=0, max=max_latent_len).to(dtype=torch.long)
 
     def _forward_context(self):
         if self.use_bf16 and self.device.type == 'cuda':
@@ -505,311 +384,6 @@ class ScheduledForcingLoop:
                     switch_to[i] = j
         return switch_at, switch_to
 
-    def _load_best_metrics(self):
-        path = os.path.join(self.args.save_dir, 'best_metrics.json')
-        if not os.path.isfile(path):
-            return
-        try:
-            with open(path, 'r', encoding='utf-8') as handle:
-                payload = json.load(handle)
-            saved_metric = str(payload.get('selection_metric', 'metrics_val/mse'))
-            expected_metric = f'metrics_val/{self.eval_primary_metric}'
-            if saved_metric != expected_metric:
-                logger.log(
-                    f"[eval] Ignoring best score selected by {saved_metric}; "
-                    f"current selection uses {expected_metric}."
-                )
-                return
-            self.best_val_score = float(payload[expected_metric])
-        except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError) as exc:
-            logger.log(f"[eval] Ignoring invalid {path}: {exc}")
-
-    def _eval_noise(self, keys, split, primitive, shape, dtype):
-        samples = []
-        for key in keys:
-            material = f"{self.eval_seed}:{split}:{key}:{primitive}".encode('utf-8')
-            seed = int.from_bytes(hashlib.blake2b(material, digest_size=8).digest(), 'little')
-            generator = torch.Generator(device='cpu')
-            generator.manual_seed(seed & ((1 << 63) - 1))
-            samples.append(torch.randn(shape[1:], generator=generator, dtype=dtype))
-        return torch.stack(samples, dim=0).to(self.device)
-
-    def _qpos_stats_for_keys(self, loader, keys):
-        """Return per-sample qpos normalization stats, including composites."""
-        dataset = loader.dataset
-        if hasattr(dataset, 'datasets') and hasattr(dataset, 'dataset_names'):
-            components = {
-                name: component
-                for name, component in zip(dataset.dataset_names, dataset.datasets)
-            }
-            means, stds = [], []
-            for key in keys:
-                if ':' not in key:
-                    raise ValueError(
-                        "Composite G1-TMR evaluation requires namespaced motion keys."
-                    )
-                dataset_name = key.split(':', 1)[0]
-                component = components[dataset_name]
-                means.append(torch.as_tensor(component.mean))
-                stds.append(torch.as_tensor(component.std))
-            mean = torch.stack(means, dim=0)
-            std = torch.stack(stds, dim=0)
-        else:
-            mean = torch.as_tensor(dataset.mean).unsqueeze(0).expand(len(keys), -1)
-            std = torch.as_tensor(dataset.std).unsqueeze(0).expand(len(keys), -1)
-        return (
-            mean.to(self.device, dtype=torch.float32),
-            std.to(self.device, dtype=torch.float32),
-        )
-
-    def _denormalize_eval_qpos(self, normalized_motion, mean, std):
-        qpos = normalized_motion.squeeze(2).transpose(1, 2).float()
-        qpos = qpos * std[:, None, :] + mean[:, None, :]
-        if getattr(self.args, 'relative_root_xy', False):
-            normalized = normalized_motion.squeeze(2).transpose(1, 2).float()
-            qpos[..., :2] = normalized[..., :2] * std[:, None, :2]
-        return qpos
-
-    @staticmethod
-    def _merge_g1_tmr_records(records):
-        if not records:
-            return {}
-        array_fields = (
-            'text', 'generated', 'real', 'generated_feet', 'real_feet', 'lengths'
-        )
-        merged = {
-            name: np.concatenate([record[name] for record in records], axis=0)
-            for name in array_fields
-        }
-        merged['positive_ids'] = [
-            positive_id for record in records for positive_id in record['positive_ids']
-        ]
-        return merged
-
-    @torch.no_grad()
-    def evaluate_split(self, split):
-        loader = self.eval_loaders[split]
-        eval_model = self.model_avg if self.args.use_ema else self.model
-        was_training = eval_model.training
-        eval_model.eval()
-        metric_sums = {}
-        metric_counts = {}
-        local_samples = 0
-        g1_tmr_records = []
-
-        for batch_idx, (raw_motion_full, cond) in enumerate(loader):
-            non_blocking = self.device.type == 'cuda'
-            raw_motion_full = raw_motion_full.to(self.device, non_blocking=non_blocking)
-            raw_lengths = cond['y']['lengths'].to(self.device, non_blocking=non_blocking)
-            text_list = cond['y'].get('text')
-            token_list = cond['y'].get('tokens')
-            keys = cond['y'].get('db_key')
-            if keys is None:
-                raise RuntimeError("Held-out evaluation requires motion keys.")
-
-            if self.use_motion_tokenizer_latent:
-                motion_full = self._encode_motion_latents(raw_motion_full)
-                lengths = self._latent_lengths(raw_lengths, motion_full.shape[-1])
-            else:
-                motion_full = raw_motion_full
-                lengths = raw_lengths
-
-            bs = motion_full.shape[0]
-            text_cache = None
-            if text_list is not None and 'text' in self.cond_mode:
-                text_cache = eval_model.encode_text(text_list)
-            prefix = motion_full[..., :self.context_len]
-            initial_prefix = prefix
-            generated = []
-
-            for primitive in range(self.n_primitives):
-                starts = [primitive * self.pred_len] * bs
-                source_indices = list(range(bs))
-                pred_mask, pred_lengths = self._build_primitive_mask(
-                    lengths, source_indices, starts
-                )
-                prim_cond = self._build_primitive_cond(
-                    prefix,
-                    text_list,
-                    token_list,
-                    bs,
-                    pred_mask=pred_mask,
-                    pred_lengths=pred_lengths,
-                    text_embed=text_cache,
-                )
-                self._apply_cond_modifiers(prim_cond['y'])
-                noise = self._eval_noise(
-                    keys,
-                    split,
-                    primitive,
-                    (bs, motion_full.shape[1], motion_full.shape[2], self.pred_len),
-                    motion_full.dtype,
-                )
-                with self._forward_context():
-                    pred = self.diffusion.sample_loop(
-                        eval_model,
-                        noise.shape,
-                        noise=noise,
-                        model_kwargs=prim_cond,
-                        device=self.device,
-                    )
-                pred = pred.to(dtype=motion_full.dtype)
-                generated.append(pred)
-                prefix = torch.cat([prefix, pred], dim=-1)[..., -self.context_len:]
-
-            pred_full = torch.cat(generated, dim=-1)
-            target = motion_full[
-                ..., self.context_len:self.context_len + self.n_primitives * self.pred_len
-            ]
-            valid_lengths = (
-                lengths - self.context_len
-            ).clamp(min=0, max=target.shape[-1])
-            mask = lengths_to_mask(valid_lengths, target.shape[-1]).unsqueeze(1).unsqueeze(1)
-
-            if self.use_motion_tokenizer_latent:
-                latent_full = torch.cat([initial_prefix, pred_full], dim=-1)
-                decoded = self._decode_motion_latents(
-                    latent_full,
-                    target_len=self.motion_raw_context_len + self.n_primitives * self.motion_raw_pred_len,
-                )
-                pred_for_metrics = decoded[..., self.motion_raw_context_len:]
-                target_for_metrics = raw_motion_full[
-                    ...,
-                    self.motion_raw_context_len:
-                    self.motion_raw_context_len + self.n_primitives * self.motion_raw_pred_len,
-                ]
-                prefix_for_metrics = decoded[..., :self.motion_raw_context_len]
-                raw_valid = (
-                    raw_lengths - self.motion_raw_context_len
-                ).clamp(min=0, max=target_for_metrics.shape[-1])
-                mask = lengths_to_mask(raw_valid, target_for_metrics.shape[-1]).unsqueeze(1).unsqueeze(1)
-            else:
-                pred_for_metrics = pred_full
-                target_for_metrics = target
-                prefix_for_metrics = initial_prefix
-
-            metrics = masked_motion_metrics(
-                pred_for_metrics,
-                target_for_metrics,
-                mask,
-                prefix=prefix_for_metrics,
-            )
-            for name, values in metrics.items():
-                short_name = name.removeprefix('metrics/')
-                if short_name.startswith('mse_acc'):
-                    eligible = raw_valid >= 3 if self.use_motion_tokenizer_latent else valid_lengths >= 3
-                elif short_name.startswith('mse_velocity'):
-                    eligible = raw_valid >= 2 if self.use_motion_tokenizer_latent else valid_lengths >= 2
-                else:
-                    eligible = raw_valid >= 1 if self.use_motion_tokenizer_latent else valid_lengths >= 1
-                metric_sums[short_name] = (
-                    metric_sums.get(short_name, 0.0)
-                    + values[eligible].double().sum()
-                )
-                metric_counts[short_name] = (
-                    metric_counts.get(short_name, 0) + eligible.sum()
-                )
-            local_samples += bs
-
-            if self.g1_tmr_evaluator is not None:
-                if text_list is None:
-                    raise RuntimeError("G1-TMR evaluation requires text captions.")
-                metric_lengths = raw_valid if self.use_motion_tokenizer_latent else valid_lengths
-                mean, std = self._qpos_stats_for_keys(loader, keys)
-                generated_qpos = self._denormalize_eval_qpos(
-                    pred_for_metrics, mean, std
-                )
-                real_qpos = self._denormalize_eval_qpos(
-                    target_for_metrics, mean, std
-                )
-                g1_tmr_records.append(
-                    self.g1_tmr_evaluator.encode_batch(
-                        generated_qpos,
-                        real_qpos,
-                        metric_lengths,
-                        list(text_list),
-                        list(keys),
-                    )
-                )
-
-            if batch_idx and batch_idx % 100 == 0 and dist_util.is_main_process():
-                logger.log(f"[eval:{split}] processed at least {batch_idx * loader.batch_size} samples")
-
-        global_samples = int(dist_util.reduce_sum(local_samples).item())
-        if global_samples == 0:
-            raise RuntimeError(f"The {split} split contains no evaluable samples.")
-        results = {}
-        for name, total in metric_sums.items():
-            count = int(dist_util.reduce_sum(metric_counts[name]).item())
-            if count > 0:
-                results[name] = dist_util.reduce_sum(total).item() / count
-        if self.g1_tmr_evaluator is not None:
-            local_records = self._merge_g1_tmr_records(g1_tmr_records)
-            if dist.is_initialized():
-                gathered_records = [None for _ in range(dist.get_world_size())]
-                dist.all_gather_object(gathered_records, local_records)
-            else:
-                gathered_records = [local_records]
-            if dist_util.is_main_process():
-                results.update(self.g1_tmr_evaluator.aggregate(gathered_records))
-        results['num_samples'] = global_samples
-        if was_training:
-            eval_model.train()
-        return results
-
-    def _run_evaluation(self, split):
-        dist_util.barrier()
-        logger.log(f"[eval:{split}] starting full generative rollout at step {self.total_step()}")
-        results = self.evaluate_split(split)
-        if dist_util.is_main_process():
-            group = f"metrics_{split}"
-            reported_results = results
-            if self.g1_tmr_evaluator is not None and not getattr(
-                self.args, 'eval_log_diagnostics', False
-            ):
-                headline = {
-                    'mse',
-                    'tmr_r_at_3',
-                    'tmr_fid',
-                    'foot_skate_cm_s',
-                    'grounding_score',
-                    'real_foot_skate_cm_s',
-                    'real_grounding_score',
-                    'num_samples',
-                }
-                reported_results = {
-                    name: value for name, value in results.items() if name in headline
-                }
-            self.train_platform.report_scalars(
-                dict(sorted(reported_results.items())),
-                iteration=self.total_step(),
-                group_name=group,
-            )
-            logger.log(
-                f"[eval:{split}] step={self.total_step()} samples={results['num_samples']} "
-                f"mse={results['mse']:.6f}"
-                + (
-                    f" r@3={results['tmr_r_at_3']:.6f} "
-                    f"fid={results['tmr_fid']:.6f} "
-                    f"skate={results['foot_skate_cm_s']:.3f}cm/s"
-                    if 'tmr_r_at_3' in results
-                    else ''
-                )
-            )
-            if split == 'val':
-                if self.eval_primary_metric not in results:
-                    raise RuntimeError(
-                        f"Validation selection metric {self.eval_primary_metric!r} "
-                        f"was not produced; available={sorted(results)}"
-                    )
-                value = float(results[self.eval_primary_metric])
-                maximize = self.eval_primary_metric == 'tmr_r_at_3'
-                improved = value > self.best_val_score if maximize else value < self.best_val_score
-                if improved:
-                    self.best_val_score = value
-                    self.save_best(results)
-        dist_util.barrier()
-
     def run_loop(self):
         if dist_util.is_main_process():
             print(f'[Scheduled Forcing] n_primitives={self.n_primitives}, '
@@ -825,6 +399,11 @@ class ScheduledForcingLoop:
                       f'ramp_steps={self.self_rollout_ramp_steps}')
             print(f'[Scheduled Forcing] full_len per sample = '
                   f'{self.context_len + self.n_primitives * self.pred_len} frames')
+            if self.training_rtc:
+                print(
+                    f'[Training RTC] enabled, uniform delay in '
+                    f'[0, {self.rtc_max_delay}] action frames'
+                )
             print(f'[Scheduled Forcing] train steps: {self.num_steps}')
 
         for epoch in range(self.num_epochs):
@@ -851,13 +430,7 @@ class ScheduledForcingLoop:
                 bs = motion_full.shape[0]
                 text_list = cond['y'].get('text', None)
                 token_list = cond['y'].get('tokens', None)
-                raw_motion_lengths = cond['y']['lengths']
-                raw_motion_full = motion_full
-                if self.use_motion_tokenizer_latent:
-                    motion_full = self._encode_motion_latents(motion_full)
-                    motion_lengths = self._latent_lengths(raw_motion_lengths, motion_full.shape[-1])
-                else:
-                    motion_lengths = raw_motion_lengths
+                motion_lengths = cond['y']['lengths']
                 text_cache = self._encode_text_cache(text_list)
 
                 p_replace = (
@@ -894,10 +467,8 @@ class ScheduledForcingLoop:
                     #                   from j's beginning (k_new = k - switch_at)
                     gt_prefix_parts = []
                     gt_pred_parts = []
-                    raw_gt_pred_parts = []
                     source_indices = []
                     primitive_starts = []
-                    raw_primitive_starts = []
                     cur_text = list(text_list) if text_list is not None else None
                     cur_tokens = list(token_list) if token_list is not None else None
 
@@ -906,21 +477,14 @@ class ScheduledForcingLoop:
                         src = switch_to[i] if switched else i
                         k_eff = (k - switch_at[i]) if switched else k
                         s = k_eff * self.pred_len
-                        raw_s = k_eff * self.motion_raw_pred_len
                         source_indices.append(src)
                         primitive_starts.append(s)
-                        raw_primitive_starts.append(raw_s)
                         gt_prefix_parts.append(
                             motion_full[src:src+1, ..., s:s + self.context_len])
                         gt_pred_parts.append(
                             motion_full[src:src+1, ...,
                                         s + self.context_len:
                                         s + self.context_len + self.pred_len])
-                        if self.use_motion_tokenizer_latent:
-                            raw_gt_pred_parts.append(
-                                raw_motion_full[src:src+1, ...,
-                                                raw_s + self.motion_raw_context_len:
-                                                raw_s + self.motion_raw_context_len + self.motion_raw_pred_len])
                         if switched:
                             if cur_text is not None:
                                 cur_text[i] = text_list[src]
@@ -931,19 +495,6 @@ class ScheduledForcingLoop:
                     gt_pred = torch.cat(gt_pred_parts, dim=0)
                     pred_mask, pred_lengths = self._build_primitive_mask(
                         motion_lengths, source_indices, primitive_starts)
-                    raw_gt_pred = None
-                    raw_pred_mask = None
-                    if self.use_motion_tokenizer_latent:
-                        raw_gt_pred = torch.cat(raw_gt_pred_parts, dim=0)
-                        raw_valid_lengths = []
-                        for src, raw_start in zip(source_indices, raw_primitive_starts):
-                            motion_len = int(raw_motion_lengths[src].item())
-                            target_start = raw_start + self.motion_raw_context_len
-                            valid = max(0, min(self.motion_raw_pred_len, motion_len - target_start))
-                            raw_valid_lengths.append(valid)
-                        raw_pred_lengths = torch.tensor(raw_valid_lengths, dtype=torch.long, device=self.device)
-                        raw_frame_ids = torch.arange(self.motion_raw_pred_len, device=self.device).view(1, 1, 1, -1)
-                        raw_pred_mask = raw_frame_ids < raw_pred_lengths.view(-1, 1, 1, 1)
                     cur_text_embed = self._select_text_cache(text_cache, source_indices)
 
                     # ── decide prefix: GT or model's own prediction ──
@@ -962,6 +513,12 @@ class ScheduledForcingLoop:
                                 torch.rand(bs, device=self.device) < p_replace
                             )
                             use_model = rollout_active.view(bs, 1, 1, 1)
+                        switched_samples = torch.as_tensor(
+                            [k >= switch_at[i] for i in range(bs)],
+                            dtype=torch.bool,
+                            device=self.device,
+                        ).view(bs, 1, 1, 1)
+                        use_model = use_model | switched_samples
                         combined = torch.cat([prev_prefix, prev_model_output], dim=-1)
                         model_prefix = combined[..., -self.context_len:]
                         cur_prefix = torch.where(use_model, model_prefix, gt_prefix)
@@ -974,6 +531,17 @@ class ScheduledForcingLoop:
                     smooth_extras = self._compute_smooth_targets(
                         gt_pred, prim_cond['y']['mask'])
                     prim_cond['y'].update(smooth_extras)
+                    if self.training_rtc:
+                        prim_cond['y']['rtc_delay'] = torch.randint(
+                            0,
+                            self.rtc_max_delay + 1,
+                            (bs,),
+                            device=self.device,
+                            dtype=torch.long,
+                        )
+                        prim_cond['y']['rtc_prefix_noise_std'] = (
+                            self.rtc_prefix_noise_std
+                        )
                     self._apply_cond_modifiers(prim_cond['y'])
 
                     # ── diffusion training step ──
@@ -991,12 +559,6 @@ class ScheduledForcingLoop:
                                 dataset=self.data.dataset,
                                 return_model_output=True,
                             )
-
-                        if self.use_motion_tokenizer_latent:
-                            raw_metrics = self._decoded_raw_motion_metrics(
-                                terms['model_output'], raw_gt_pred, raw_pred_mask, prefix_latent=cur_prefix)
-                            terms = {key: value for key, value in terms.items() if not key.startswith('metrics/')}
-                            terms.update(raw_metrics)
 
                         weighted_loss = terms['loss'] * weights
                         if self.use_continuous_rollout:
@@ -1099,25 +661,9 @@ class ScheduledForcingLoop:
                     dist_util.barrier()
                     if dist_util.is_main_process():
                         self.save()
-                        self.model.eval()
-                        self.generate_during_training()
-                        self.model.train()
                     dist_util.barrier()
                     if os.environ.get("DIFFUSION_TRAINING_TEST", "") and self.total_step() > 0:
                         return
-
-                if (
-                    self.val_eval_interval > 0
-                    and self.total_step() > 0
-                    and self.total_step() % self.val_eval_interval == 0
-                ):
-                    self._run_evaluation('val')
-                if (
-                    self.test_eval_interval > 0
-                    and self.total_step() > 0
-                    and self.total_step() % self.test_eval_interval == 0
-                ):
-                    self._run_evaluation('test')
 
                 self.step += 1
 
@@ -1193,7 +739,7 @@ class ScheduledForcingLoop:
                 load_model_wo_clip(self.model, state_dict)
                 if self.args.use_ema:
                     print('loading model_avg from model')
-                    self.model_avg.load_state_dict(self.model.state_dict(), strict=False)
+                    self.model_avg.load_state_dict(self.model.state_dict(), strict=True)
         elif getattr(self.args, 'finetune_from', ''):
             ckpt_path = self.args.finetune_from
             logger.log(f"[Fine-tune] Loading pretrained weights: {ckpt_path}")
@@ -1208,7 +754,7 @@ class ScheduledForcingLoop:
                 load_model_wo_clip(self.model, state_dict)
                 if self.args.use_ema:
                     self.model_avg.load_state_dict(
-                        self.model.state_dict(), strict=False)
+                        self.model.state_dict(), strict=True)
 
         dist_util.sync_params(self.model.parameters())
         dist_util.sync_params(self.model.buffers())
@@ -1256,29 +802,6 @@ class ScheduledForcingLoop:
             del_clip(state_dict_avg)
             return {'model': state_dict, 'model_avg': state_dict_avg}
         return state_dict
-
-    def save_best(self, metrics):
-        value = metrics[self.eval_primary_metric]
-        logger.log(
-            f"[eval:val] new best {self.eval_primary_metric}={value:.6f}; "
-            "saving best.pt"
-        )
-        with bf.BlobFile(bf.join(self.save_dir, 'best.pt'), 'wb') as handle:
-            torch.save(self._checkpoint_state(), handle)
-        payload = {
-            'step': self.total_step(),
-            'selection_metric': f'metrics_val/{self.eval_primary_metric}',
-            **{f'metrics_val/{key}': value for key, value in metrics.items()},
-        }
-        with open(os.path.join(self.save_dir, 'best_metrics.json'), 'w', encoding='utf-8') as handle:
-            json.dump(payload, handle, indent=2, sort_keys=True)
-
-    def generate_during_training(self):
-        if not self.args.gen_during_training:
-            return
-        raise NotImplementedError(
-            "gen_during_training needs a standard sampler; the legacy sampler was removed."
-        )
 
     def find_resume_checkpoint(self) -> Optional[str]:
         matches = {file: re.match(r'model(\d+).pt$', file)

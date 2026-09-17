@@ -80,6 +80,19 @@ def prepare_scheduled_forcing_run(args):
     if rollout_mode not in {"random_replace", "continuous"}:
         raise ValueError(f"Unsupported self_rollout_mode={rollout_mode!r}.")
 
+    if getattr(args, "training_rtc", True):
+        max_delay = int(getattr(args, "rtc_max_delay", 6))
+        prefix_noise_std = float(getattr(args, "rtc_prefix_noise_std", 0.0))
+        if max_delay < 0 or max_delay >= int(args.pred_len):
+            raise ValueError(
+                "training-time RTC requires 0 <= rtc_max_delay < pred_len; "
+                f"got rtc_max_delay={max_delay}, pred_len={args.pred_len}."
+            )
+        if prefix_noise_std < 0.0:
+            raise ValueError(
+                f"rtc_prefix_noise_std must be non-negative, got {prefix_noise_std}."
+            )
+
     full_len = args.context_len + n_primitives * args.pred_len
     args = prepare_training_run(args)
     if dist_util.is_main_process():

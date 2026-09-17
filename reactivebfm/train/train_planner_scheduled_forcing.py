@@ -11,9 +11,6 @@ from .scheduled_forcing_loop import ScheduledForcingLoop
 
 def main():
     args = train_args_scheduled_forcing()
-    # The public baseline intentionally has no held-out evaluator dependency.
-    args.val_eval_interval = 0
-    args.test_eval_interval = 0
     args, full_len = prepare_scheduled_forcing_run(args)
 
     if dist_util.is_main_process():

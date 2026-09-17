@@ -123,6 +123,9 @@ torchrun --standalone --nnodes=1 --nproc_per_node=8 \
   --train_platform_type WandBPlatform
 ```
 
+- `--cross_prob` defaults to `0`. To learn streaming instruction transitions,
+  use `--cross_prob 0.1`.
+
 Replace `<reactivebfm_dataset>` with the recommended `reactivebfm_dataset`
 name, or customize it with any dataset name or comma-separated composition
 registered in the dataset registry.

@@ -32,10 +32,6 @@ class FrozenTextEncoderMixin:
         encoded_text, valid_mask = self.clip_model(raw_text)
         return encoded_text.permute(1, 0, 2), ~valid_mask
 
-    def bert_encode_text(self, raw_text):
-        """Backward-compatible name for the generic text encoding path."""
-        return self.text_encode_text(raw_text)
-
     def project_text_tokens(self, text_tokens):
         return self.embed_text(
             text_tokens.to(dtype=self.embed_text.weight.dtype)

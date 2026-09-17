@@ -18,7 +18,6 @@ class PositionalEncoding(nn.Module):
         self.register_buffer('pe', pe)
 
     def forward(self, x):
-        # not used in the final model
         x = x + self.pe[:x.shape[0], :]
         return self.dropout(x)
 
@@ -80,19 +79,6 @@ class ContinuousTimestepEmbedder(nn.Module):
         return self.time_embed(emb).unsqueeze(0)
 
 
-class ObjectCondEmbedder(nn.Module):
-    def __init__(self, input_dim, latent_dim):
-        super().__init__()
-        self.embed = nn.Sequential(
-            nn.Linear(input_dim, latent_dim),
-            nn.SiLU(),
-            nn.Linear(latent_dim, latent_dim),
-        )
-
-    def forward(self, obj_feat):
-        return self.embed(obj_feat).unsqueeze(0)
-
-
 class InputProcess(nn.Module):
     def __init__(self, data_rep, input_feats, latent_dim):
         super().__init__()
@@ -149,15 +135,4 @@ class OutputProcess(nn.Module):
             raise ValueError
         output = output.reshape(nframes, bs, self.njoints, self.nfeats)
         output = output.permute(1, 2, 3, 0)  # [bs, njoints, nfeats, nframes]
-        return output
-
-
-class EmbedAction(nn.Module):
-    def __init__(self, num_actions, latent_dim):
-        super().__init__()
-        self.action_embedding = nn.Parameter(torch.randn(num_actions, latent_dim))
-
-    def forward(self, input):
-        idx = input[:, 0].to(torch.long)  # an index array must be long
-        output = self.action_embedding[idx]
         return output

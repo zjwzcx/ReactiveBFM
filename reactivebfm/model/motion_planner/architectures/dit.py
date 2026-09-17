@@ -2,6 +2,7 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from reactivebfm.model.text_encoder.conditioning import FrozenTextEncoderMixin
 from reactivebfm.model.utils import (
@@ -20,6 +21,101 @@ def _modulate(hidden_states, shift, scale):
     return hidden_states * (1.0 + scale) + shift
 
 
+class _DiTAttention(nn.Module):
+    """Explicit-QKV attention used by the RoPE and text-cache paths."""
+
+    def __init__(
+        self,
+        width,
+        num_heads,
+        dropout=0.0,
+        rope=False,
+        is_cross=False,
+    ):
+        super().__init__()
+        if width % num_heads:
+            raise ValueError(f"width ({width}) must be divisible by num_heads ({num_heads}).")
+        self.width = width
+        self.num_heads = num_heads
+        self.head_dim = width // num_heads
+        self.dropout = dropout
+        self.rope = bool(rope) and not is_cross
+        if self.rope and self.head_dim % 2:
+            raise ValueError("RoPE requires an even attention head width.")
+        self.q_proj = nn.Linear(width, width)
+        self.k_proj = nn.Linear(width, width)
+        self.v_proj = nn.Linear(width, width)
+        self.out_proj = nn.Linear(width, width)
+        if self.rope:
+            inv_freq = 1.0 / (
+                10000.0
+                ** (torch.arange(0, self.head_dim, 2, dtype=torch.float32) / self.head_dim)
+            )
+            self.register_buffer("inv_freq", inv_freq)
+        else:
+            self.register_buffer("inv_freq", torch.empty(0), persistent=False)
+
+    def _reshape(self, tensor):
+        batch_size, sequence_length, _ = tensor.shape
+        return tensor.view(
+            batch_size, sequence_length, self.num_heads, self.head_dim
+        ).transpose(1, 2)
+
+    def _apply_rope(self, tensor, positions):
+        if not self.rope:
+            return tensor
+        if positions is None:
+            positions = torch.arange(tensor.shape[2], device=tensor.device)[None]
+        frequencies = torch.einsum(
+            "bt,d->btd", positions.to(self.inv_freq.dtype), self.inv_freq
+        )
+        cosine = frequencies.cos()[:, None, :, :].to(tensor.dtype)
+        sine = frequencies.sin()[:, None, :, :].to(tensor.dtype)
+        even = tensor[..., 0::2]
+        odd = tensor[..., 1::2]
+        return torch.stack(
+            [even * cosine - odd * sine, even * sine + odd * cosine], dim=-1
+        ).flatten(-2)
+
+    def project_kv(self, key_value_states):
+        return (
+            self._reshape(self.k_proj(key_value_states)),
+            self._reshape(self.v_proj(key_value_states)),
+        )
+
+    def forward(
+        self,
+        query_states,
+        key_value_states=None,
+        key_padding_mask=None,
+        positions=None,
+        key_value_cache=None,
+    ):
+        if key_value_states is None:
+            key_value_states = query_states
+        query = self._reshape(self.q_proj(query_states))
+        if key_value_cache is None:
+            key, value = self.project_kv(key_value_states)
+        else:
+            key, value = key_value_cache
+        query = self._apply_rope(query, positions)
+        if self.rope and key_value_cache is None:
+            key_positions = torch.arange(key.shape[2], device=key.device)[None]
+            key = self._apply_rope(key, key_positions.expand(key.shape[0], -1))
+        attention_mask = None
+        if key_padding_mask is not None:
+            attention_mask = ~key_padding_mask[:, None, None, :].to(torch.bool)
+        attended = F.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=attention_mask,
+            dropout_p=self.dropout if self.training else 0.0,
+            is_causal=False,
+        )
+        return self.out_proj(attended.transpose(1, 2).reshape(query_states.shape[0], query_states.shape[1], self.width))
+
+
 class DiTBlock(nn.Module):
     """AdaLN-Zero DiT block with text cross-attention.
 
@@ -36,6 +132,8 @@ class DiTBlock(nn.Module):
         ff_size,
         dropout=0.0,
         activation="gelu",
+        rope=False,
+        text_kv_cache=False,
     ):
         super().__init__()
         if num_heads <= 0 or latent_dim % num_heads:
@@ -47,19 +145,35 @@ class DiTBlock(nn.Module):
             raise ValueError(f"ff_size must be positive, got {ff_size}.")
 
         self.self_norm = nn.LayerNorm(latent_dim, elementwise_affine=False)
-        self.self_attention = nn.MultiheadAttention(
-            latent_dim,
-            num_heads,
-            dropout=dropout,
-            batch_first=True,
-        )
+        use_custom_attention = bool(rope or text_kv_cache)
+        if use_custom_attention:
+            self.self_attention = _DiTAttention(
+                latent_dim,
+                num_heads,
+                dropout=dropout,
+                rope=rope,
+            )
+            self.cross_attention = _DiTAttention(
+                latent_dim,
+                num_heads,
+                dropout=dropout,
+                rope=False,
+                is_cross=True,
+            )
+        else:
+            self.self_attention = nn.MultiheadAttention(
+                latent_dim,
+                num_heads,
+                dropout=dropout,
+                batch_first=True,
+            )
+            self.cross_attention = nn.MultiheadAttention(
+                latent_dim,
+                num_heads,
+                dropout=dropout,
+                batch_first=True,
+            )
         self.cross_norm = nn.LayerNorm(latent_dim, elementwise_affine=False)
-        self.cross_attention = nn.MultiheadAttention(
-            latent_dim,
-            num_heads,
-            dropout=dropout,
-            batch_first=True,
-        )
         self.mlp_norm = nn.LayerNorm(latent_dim, elementwise_affine=False)
         activation_layer = {
             "gelu": nn.GELU(approximate="tanh"),
@@ -75,6 +189,7 @@ class DiTBlock(nn.Module):
             nn.Linear(ff_size, latent_dim),
             nn.Dropout(dropout),
         )
+        self.text_kv_cache = bool(text_kv_cache)
 
         # shift, scale, and residual gate for self-attention, cross-attention,
         # and the MLP respectively.
@@ -92,8 +207,18 @@ class DiTBlock(nn.Module):
         text_tokens,
         motion_padding_mask=None,
         text_padding_mask=None,
+        time_condition_ids=None,
+        motion_positions=None,
+        text_kv_cache=None,
     ):
-        modulation = self.ada_ln(time_condition).chunk(9, dim=-1)
+        modulation = self.ada_ln(time_condition)
+        if time_condition_ids is not None:
+            modulation = torch.gather(
+                modulation,
+                1,
+                time_condition_ids[:, :, None].expand(-1, -1, modulation.shape[-1]),
+            )
+        modulation = modulation.chunk(9, dim=-1)
         (
             self_shift,
             self_scale,
@@ -109,26 +234,41 @@ class DiTBlock(nn.Module):
         normalized = _modulate(
             self.self_norm(hidden_states), self_shift, self_scale
         )
-        attended = self.self_attention(
-            normalized,
-            normalized,
-            normalized,
-            key_padding_mask=motion_padding_mask,
-            need_weights=False,
-        )[0]
+        if isinstance(self.self_attention, _DiTAttention):
+            attended = self.self_attention(
+                normalized,
+                key_padding_mask=motion_padding_mask,
+                positions=motion_positions,
+            )
+        else:
+            attended = self.self_attention(
+                normalized,
+                normalized,
+                normalized,
+                key_padding_mask=motion_padding_mask,
+                need_weights=False,
+            )[0]
         gate = self_gate[:, None, :] if self_gate.ndim == 2 else self_gate
         hidden_states = hidden_states + gate * attended
 
         query = _modulate(
             self.cross_norm(hidden_states), cross_shift, cross_scale
         )
-        attended = self.cross_attention(
-            query,
-            text_tokens,
-            text_tokens,
-            key_padding_mask=text_padding_mask,
-            need_weights=False,
-        )[0]
+        if isinstance(self.cross_attention, _DiTAttention):
+            attended = self.cross_attention(
+                query,
+                text_tokens,
+                key_padding_mask=text_padding_mask,
+                key_value_cache=text_kv_cache,
+            )
+        else:
+            attended = self.cross_attention(
+                query,
+                text_tokens,
+                text_tokens,
+                key_padding_mask=text_padding_mask,
+                need_weights=False,
+            )[0]
         gate = cross_gate[:, None, :] if cross_gate.ndim == 2 else cross_gate
         hidden_states = hidden_states + gate * attended
 
@@ -152,8 +292,15 @@ class DiTFinalLayer(nn.Module):
         nn.init.zeros_(self.ada_ln[-1].weight)
         nn.init.zeros_(self.ada_ln[-1].bias)
 
-    def forward(self, hidden_states, time_condition):
-        shift, scale = self.ada_ln(time_condition).chunk(2, dim=-1)
+    def forward(self, hidden_states, time_condition, time_condition_ids=None):
+        modulation = self.ada_ln(time_condition)
+        if time_condition_ids is not None:
+            modulation = torch.gather(
+                modulation,
+                1,
+                time_condition_ids[:, :, None].expand(-1, -1, modulation.shape[-1]),
+            )
+        shift, scale = modulation.chunk(2, dim=-1)
         return _modulate(self.norm(hidden_states), shift, scale)
 
 
@@ -233,6 +380,11 @@ class DiTMotionPlanner(FrozenTextEncoderMixin, nn.Module):
         self.mask_frames = kargs.get("mask_frames", False)
         self.arch = arch
 
+        self.dit_role_embedding = bool(kargs.get("dit_role_embedding", False))
+        self.dit_rtc_time_cache = bool(kargs.get("dit_rtc_time_cache", False))
+        self.dit_rope = bool(kargs.get("dit_rope", False))
+        self.dit_text_kv_cache = bool(kargs.get("dit_text_kv_cache", False))
+
         self.context_len = kargs.get("context_len", 0)
         self.pred_len = kargs.get("pred_len", 0)
         if self.context_len <= 0 or self.pred_len <= 0:
@@ -253,6 +405,11 @@ class DiTMotionPlanner(FrozenTextEncoderMixin, nn.Module):
         )
         self.embed_flow_timestep = ContinuousTimestepEmbedder(self.latent_dim)
 
+        if self.dit_role_embedding:
+            # [0] observed prefix role, [1] predicted action role.  Zero init
+            # makes enabling the option non-invasive at step zero.
+            self.role_embedding = nn.Parameter(torch.zeros(2, self.latent_dim))
+
         self.blocks = nn.ModuleList(
             [
                 DiTBlock(
@@ -261,6 +418,8 @@ class DiTMotionPlanner(FrozenTextEncoderMixin, nn.Module):
                     ff_size=self.ff_size,
                     dropout=self.dropout,
                     activation=self.activation,
+                    rope=self.dit_rope,
+                    text_kv_cache=self.dit_text_kv_cache,
                 )
                 for _ in range(self.num_layers)
             ]
@@ -312,22 +471,69 @@ class DiTMotionPlanner(FrozenTextEncoderMixin, nn.Module):
         motion_tokens = self.input_process(motion)
         motion_tokens = self.sequence_pos_encoder(motion_tokens).transpose(0, 1)
 
-        time_condition = self._time_condition(x, timesteps, y)
+        time_condition, time_condition_ids = self._time_condition(x, timesteps, y)
         text_tokens, text_padding_mask = self._text_condition(y, batch_size)
         motion_padding_mask = self._motion_padding_mask(
             y["mask"], batch_size, action_length, x.device
         )
 
-        for block in self.blocks:
+        if self.dit_role_embedding:
+            roles = torch.cat(
+                [
+                    torch.zeros(self.context_len, dtype=torch.long, device=x.device),
+                    torch.ones(action_length, dtype=torch.long, device=x.device),
+                ],
+                dim=0,
+            )
+            motion_tokens = motion_tokens + self.role_embedding[roles][None].to(
+                dtype=motion_tokens.dtype
+            )
+        motion_positions = None
+        if self.dit_rope:
+            motion_positions = torch.arange(
+                self.context_len + action_length, device=x.device
+            )[None].expand(batch_size, -1)
+
+        text_kv_caches = None
+        if self.dit_text_kv_cache:
+            cache_key = y.get("_dit_text_cache_key")
+            cached = y.get("_dit_text_kv_cache")
+            if (
+                not self.training
+                and cached is not None
+                and cached[0] == cache_key
+            ):
+                text_kv_caches = cached[1]
+            else:
+                text_kv_caches = [
+                    block.cross_attention.project_kv(text_tokens)
+                    if isinstance(block.cross_attention, _DiTAttention)
+                    else None
+                    for block in self.blocks
+                ]
+                if not self.training:
+                    # Reuse projected per-layer text K/V across all ODE solver
+                    # calls in a sampling rollout.  Training deliberately does
+                    # not retain graphs or stochastic text-mask results.
+                    y["_dit_text_kv_cache"] = (cache_key, text_kv_caches)
+
+        for block_idx, block in enumerate(self.blocks):
             motion_tokens = block(
                 motion_tokens,
                 time_condition,
                 text_tokens,
                 motion_padding_mask=motion_padding_mask,
                 text_padding_mask=text_padding_mask,
+                time_condition_ids=time_condition_ids,
+                motion_positions=motion_positions,
+                text_kv_cache=(
+                    text_kv_caches[block_idx] if text_kv_caches is not None else None
+                ),
             )
 
-        output = self.final_layer(motion_tokens, time_condition)
+        output = self.final_layer(
+            motion_tokens, time_condition, time_condition_ids=time_condition_ids
+        )
         output = output[:, self.context_len :].transpose(0, 1)
         output = self.output_process(output)
         action_valid = ~motion_padding_mask[:, self.context_len :]
@@ -337,18 +543,63 @@ class DiTMotionPlanner(FrozenTextEncoderMixin, nn.Module):
         )
 
     def _time_condition(self, x, timesteps, y):
+        if "rtc_time" in y:
+            action_time = y["rtc_time"].to(device=x.device)
+            batch_size, _, _, action_length = x.shape
+            if action_time.shape != (batch_size, action_length):
+                raise ValueError(
+                    "RTC time must have shape [B, pred_len] for DiT, got "
+                    f"{tuple(action_time.shape)}"
+                )
+            context_time = y.get("flow_time", timesteps).to(device=x.device)
+            context_embedding = self.embed_flow_timestep(
+                context_time.reshape(-1)
+            ).squeeze(0)
+            context_base = context_embedding
+            context_embedding = context_embedding[:, None, :].expand(
+                batch_size, self.context_len, self.latent_dim
+            )
+            if self.dit_rtc_time_cache:
+                # RTC only exposes two distinct token times: the sampled tau
+                # and clean tau=0.  Compute AdaLN once per value and gather by
+                # token, avoiding repeated modulation MLP work in every block.
+                clean_embedding = self.embed_flow_timestep(
+                    torch.zeros(batch_size, device=x.device, dtype=context_time.dtype)
+                ).squeeze(0)
+                table = torch.stack([context_base, clean_embedding], dim=1)
+                action_ids = (action_time == 0.0).long()  # 1 = clean committed
+                context_ids = torch.zeros(
+                    batch_size, self.context_len, dtype=torch.long, device=x.device
+                )
+                return table, torch.cat([context_ids, action_ids], dim=1)
+            action_embedding = self.embed_flow_timestep(
+                action_time.reshape(-1)
+            ).squeeze(0).reshape(batch_size, action_length, self.latent_dim)
+            return torch.cat([context_embedding, action_embedding], dim=1), None
         if "flow_time" in y:
             embedding = self.embed_flow_timestep(
                 y["flow_time"].to(device=x.device)
             )
         else:
             embedding = self.embed_timestep(timesteps)
-        return embedding.squeeze(0)
+        embedding = embedding.squeeze(0)
+        return embedding, None
 
     def _text_condition(self, y, batch_size):
         encoded = (
             y["text_embed"] if "text_embed" in y else self.encode_text(y["text"])
         )
+        force_mask = y.get("text_uncond", False)
+        if not self.training:
+            if "text_embed" in y:
+                raw_key = ("embed", id(encoded[0]))
+            else:
+                raw_key = ("text", tuple(y["text"]))
+            cache_key = (raw_key, bool(force_mask), int(batch_size))
+            cached = y.get("_dit_text_tokens_cache")
+            if cached is not None and cached[0] == cache_key:
+                y["_dit_text_cache_key"] = cache_key
+                return cached[1], cached[2]
         text_tokens, text_padding_mask = encoded
         if text_padding_mask.shape[0] == 1 and batch_size > 1:
             text_padding_mask = torch.repeat_interleave(
@@ -356,12 +607,16 @@ class DiTMotionPlanner(FrozenTextEncoderMixin, nn.Module):
             )
         text_tokens = self.mask_cond(
             text_tokens,
-            force_mask=y.get("text_uncond", False),
+            force_mask=force_mask,
         )
         text_tokens = self.project_text_tokens(text_tokens).transpose(0, 1)
-        return text_tokens, text_padding_mask.to(
+        text_padding_mask = text_padding_mask.to(
             device=text_tokens.device, dtype=torch.bool
         )
+        if not self.training:
+            y["_dit_text_tokens_cache"] = (cache_key, text_tokens, text_padding_mask)
+            y["_dit_text_cache_key"] = cache_key
+        return text_tokens, text_padding_mask
 
     def _motion_prefix(self, prefix):
         if prefix.shape[-1] != self.context_len:

@@ -14,7 +14,7 @@ import torch
 import torch as th
 from copy import deepcopy
 from .losses import discretized_gaussian_log_likelihood, normal_kl
-from .nn import mean_flat, sum_flat
+from .nn import mean_flat
 from reactivebfm.utils.training.losses import masked_l2
 
 def get_named_beta_schedule(schedule_name, num_diffusion_timesteps, scale_betas=1.):
@@ -197,22 +197,7 @@ class GaussianDiffusion:
             / (1.0 - self.alphas_cumprod)
         )
 
-        # self.l2_loss = lambda a, b: (a - b) ** 2  # th.nn.MSELoss(reduction='none')  # must be None for handling mask later on.
         self.masked_l2 = masked_l2
-
-    # def masked_l2(self, a, b, mask):
-    #     # assuming a.shape == b.shape == bs, J, Jdim, seqlen
-    #     # assuming mask.shape == bs, 1, 1, seqlen
-    #     loss = (a - b) ** 2  # self.l2_loss(a, b)
-    #     loss = sum_flat(loss * mask.float())  # gives \sigma_euclidean over unmasked elements
-    #     n_entries = a.shape[1] * a.shape[2]
-    #     non_zero_elements = sum_flat(mask) * n_entries
-    #     # print('mask', mask.shape)
-    #     # print('non_zero_elements', non_zero_elements)
-    #     # print('loss', loss)
-    #     mse_loss_val = loss / non_zero_elements
-    #     # print('mse_loss_val', mse_loss_val)
-    #     return mse_loss_val
 
 
     def q_mean_variance(self, x_start, t):
@@ -310,45 +295,17 @@ class GaussianDiffusion:
 
 
         if recon_guidance and t[0] in model_kwargs['y']['recon_steps']:
-            # import time
             assert self.model_mean_type == ModelMeanType.START_X, 'This feature supports only X_start pred for now!'
-            # mask = model_kwargs['y']['mask'].float().to(inpainting_mask.device)
-            # inpainting_mask = (inpainting_mask * mask).bool()
-            # Perform reconstruction guidance
             with torch.enable_grad():
-                # t0 = time.time()
                 z = x.detach().requires_grad_(True)
                 hat_x = model(z, self._scale_timesteps(t), **model_kwargs)
-                # t1 = time.time()
-                # assert hat_x.shape == inpainting_mask.shape == inpainted_motion.shape
-                # guidance_loss = ((inpainted_motion - hat_x).square() * inpainting_mask).sum()
                 guidance_loss = cond_fn(hat_x, self._scale_timesteps(t), **model_kwargs)
-                # t2 = time.time()
                 cond_grad = torch.autograd.grad(guidance_loss, z)[0]  #  * (~inpainting_mask).float()
-            # t3 = time.time()
-
-            # sqrt_alpha_bar = _extract_into_tensor(self.sqrt_alphas_cumprod, t, cond_grad.shape)   
-            # grad_ws = inpainting_util.get_gradient_schedule(schedule_name=model_kwargs['y']['gradient_schedule'], 
-            #                                                         num_diffusion_steps=model_kwargs['y']['diffusion_steps'])
-            # grad_ws = np.ones([self.num_timesteps])
-            # w_r = _extract_into_tensor(grad_ws, t, cond_grad.shape) * model_kwargs['y']['recon_param']
             w_r = 1. * model_kwargs['y']['recon_param']
             sqrt_alpha_bar = self.sqrt_alphas_cumprod[t[0]]
-            # t4 = time.time()
             model_output = hat_x - (w_r * sqrt_alpha_bar  / 2) * cond_grad
-            # t5 = time.time()
-            # print('** alloc mem [{:.2f}] GB'.format(torch.cuda.memory_allocated() / 1024 / 1024 / 1024))
-            # print('=== MDM call [{:.1f}] ms'.format((t1-t0)*1e3))
-            # print('=== Calc cond [{:.1f}] ms'.format((t2-t1)*1e3))
-            # print('=== Calc grad [{:.1f}] ms'.format((t3-t2)*1e3))
-            # print('=== All the rest [{:.1f}] ms'.format((t4-t3)*1e3))
-            # print('=== Apply grad [{:.1f}] ms'.format((t5-t4)*1e3))
         else:
-            # import time
-            # t0 = time.time()
             model_output = model(x, self._scale_timesteps(t), **model_kwargs)
-            # t1 = time.time() 
-            # print('=== MDM call [{:.1f}] ms'.format((t1-t0)*1e3))
         
         
         if 'inpainting_mask' in model_kwargs['y'].keys() and 'inpainted_motion' in model_kwargs['y'].keys():
@@ -356,9 +313,6 @@ class GaussianDiffusion:
             assert self.model_mean_type == ModelMeanType.START_X, 'This feature supports only X_start pred for mow!'
             assert model_output.shape == inpainting_mask.shape == inpainted_motion.shape
             model_output = (model_output * ~inpainting_mask) + (inpainted_motion * inpainting_mask)
-            # print('model_output', model_output.shape, model_output)
-            # print('inpainting_mask', inpainting_mask.shape, inpainting_mask[0,0,0,:])
-            # print('inpainted_motion', inpainted_motion.shape, inpainted_motion)
         elif 'condition_mask' in model_kwargs['y'].keys() and 'condition_input' in model_kwargs['y'].keys():      
             inpainting_mask, inpainted_motion = model_kwargs['y']['condition_mask'], model_kwargs['y']['condition_input']
             assert self.model_mean_type == ModelMeanType.START_X, 'This feature supports only X_start pred for mow!'
@@ -400,7 +354,6 @@ class GaussianDiffusion:
             if denoised_fn is not None:
                 x = denoised_fn(x)
             if clip_denoised:
-                # print('clip_denoised', clip_denoised)
                 return x.clamp(-1, 1)
             return x
 
@@ -578,7 +531,6 @@ class GaussianDiffusion:
             model_kwargs=model_kwargs,
         )
         noise = th.randn_like(x)
-        # print('const_noise', const_noise)
         if const_noise:
             noise = noise[[0]].repeat(x.shape[0], 1, 1, 1)
         if model_kwargs is not None and 'condition_mask' in model_kwargs['y'].keys():
@@ -1503,8 +1455,6 @@ class GaussianDiffusion:
         return terms
 
     def fc_loss_rot_repr(self, gt_xyz, pred_xyz, mask):
-        def to_np_cpu(x):
-            return x.detach().cpu().numpy()
         """
         pose_xyz: SMPL batch tensor of shape: [BatchSize, 24, 3, Frames]
         """
@@ -1512,39 +1462,6 @@ class GaussianDiffusion:
 
         l_ankle_idx, r_ankle_idx = 7, 8
         l_foot_idx, r_foot_idx = 10, 11
-        """ Contact calculated by 'Kfir Method' Commented code)"""
-        # contact_signal = torch.zeros((pose_xyz.shape[0], pose_xyz.shape[3], 2), device=pose_xyz.device) # [BatchSize, Frames, 2]
-        # left_xyz = 0.5 * (pose_xyz[:, l_ankle_idx, :, :] + pose_xyz[:, l_foot_idx, :, :]) # [BatchSize, 3, Frames]
-        # right_xyz = 0.5 * (pose_xyz[:, r_ankle_idx, :, :] + pose_xyz[:, r_foot_idx, :, :])
-        # left_z, right_z = left_xyz[:, 2, :], right_xyz[:, 2, :] # [BatchSize, Frames]
-        # left_velocity = torch.linalg.norm(left_xyz[:, :, 2:] - left_xyz[:, :, :-2], axis=1)  # [BatchSize, Frames]
-        # right_velocity = torch.linalg.norm(left_xyz[:, :, 2:] - left_xyz[:, :, :-2], axis=1)
-        #
-        # left_z_mask = left_z <= torch.mean(torch.sort(left_z)[0][:, :left_z.shape[1] // 5], axis=-1)
-        # left_z_mask = torch.stack([left_z_mask, left_z_mask], dim=-1) # [BatchSize, Frames, 2]
-        # left_z_mask[:, :, 1] = False  # Blank right side
-        # contact_signal[left_z_mask] = 0.4
-        #
-        # right_z_mask = right_z <= torch.mean(torch.sort(right_z)[0][:, :right_z.shape[1] // 5], axis=-1)
-        # right_z_mask = torch.stack([right_z_mask, right_z_mask], dim=-1) # [BatchSize, Frames, 2]
-        # right_z_mask[:, :, 0] = False  # Blank left side
-        # contact_signal[right_z_mask] = 0.4
-        # contact_signal[left_z <= (torch.mean(torch.sort(left_z)[:left_z.shape[0] // 5]) + 20), 0] = 1
-        # contact_signal[right_z <= (torch.mean(torch.sort(right_z)[:right_z.shape[0] // 5]) + 20), 1] = 1
-
-        # plt.plot(to_np_cpu(left_z[0]), label='left_z')
-        # plt.plot(to_np_cpu(left_velocity[0]), label='left_velocity')
-        # plt.plot(to_np_cpu(contact_signal[0, :, 0]), label='left_fc')
-        # plt.grid()
-        # plt.legend()
-        # plt.show()
-        # plt.plot(to_np_cpu(right_z[0]), label='right_z')
-        # plt.plot(to_np_cpu(right_velocity[0]), label='right_velocity')
-        # plt.plot(to_np_cpu(contact_signal[0, :, 1]), label='right_fc')
-        # plt.grid()
-        # plt.legend()
-        # plt.show()
-
         gt_joint_xyz = gt_xyz[:, [l_ankle_idx, l_foot_idx, r_ankle_idx, r_foot_idx], :, :]  # [BatchSize, 4, 3, Frames]
         gt_joint_vel = torch.linalg.norm(gt_joint_xyz[:, :, :, 1:] - gt_joint_xyz[:, :, :, :-1], axis=2)  # [BatchSize, 4, Frames]
         fc_mask = (gt_joint_vel <= 0.01)
@@ -1553,15 +1470,6 @@ class GaussianDiffusion:
         pred_joint_vel[~fc_mask] = 0  # Blank non-contact velocities frames. [BS,4,FRAMES]
         pred_joint_vel = torch.unsqueeze(pred_joint_vel, dim=2)
 
-        """DEBUG CODE"""
-        # print(f'mask: {mask.shape}')
-        # print(f'pred_joint_vel: {pred_joint_vel.shape}')
-        # plt.title(f'Joint: {joint_idx}')
-        # plt.plot(to_np_cpu(gt_joint_vel[0]), label='velocity')
-        # plt.plot(to_np_cpu(fc_mask[0]), label='fc')
-        # plt.grid()
-        # plt.legend()
-        # plt.show()
         return self.masked_l2(pred_joint_vel, torch.zeros(pred_joint_vel.shape, device=pred_joint_vel.device),
                               mask[:, :, :, 1:])
 
