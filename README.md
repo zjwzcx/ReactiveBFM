@@ -93,6 +93,10 @@ ReactiveBFM/
 
 
 ## Data Preparation
+
+The full train/val/test data is publicly available on
+[Google Drive](https://drive.google.com/drive/folders/1cGUKce0g1lSTkebFhKxEFaDuytIeA5P0?usp=sharing).
+
 The public recipes use the **36-dimensional G1 motion representation** and
 captioned motion clips. Dataset paths are registered in
 `reactivebfm/data/datasets/registry.py`; multiple registered datasets can be
@@ -138,7 +142,7 @@ For a standalone teacher-forcing baseline, use
 
 - [x] Release the arXiv paper and project page in June, 2026.
 - [x] Release the training code in August, 2026.
-- [ ] Release all training data in September, 2026.
+- [x] Release all training data in September, 2026.
 - [ ] Release the sim2sim evaluation and deployment code for Unitree G1 in September, 2026.
 
 
