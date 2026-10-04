@@ -1,0 +1,7 @@
+defaults:
+  - base_agent
+
+_target_: scalebridge.agent.bfm_agent.BFMAgent
+config:
+  control_mode: 7
+  checkpoint: scalebridge/data/model/g1_29dof/humanoid_transformer_m/linux/model_22200_tensorrt.pt

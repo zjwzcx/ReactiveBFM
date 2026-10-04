@@ -1,0 +1,9 @@
+# Base Env Config File
+
+_target_: scalebridge.env.base_env.BaseEnv
+_recursive_: False
+device: ${device}
+config:
+  simulator: ${simulator}
+  observation: ${observation}
+  

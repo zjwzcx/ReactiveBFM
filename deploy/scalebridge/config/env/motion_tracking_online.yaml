@@ -1,0 +1,9 @@
+defaults:
+  - base_env
+
+_target_: scalebridge.env.motion_tracking_online.MotionTrackingOnlineEnv
+_recursive_: False
+config:
+  future_idx: [0, 1, 2, 3, 4, 5]
+  reference_forcing: True
+  root_height: 0.76

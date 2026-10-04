@@ -1,0 +1,9 @@
+defaults:
+  - _self_
+  - asset: g1_29dof
+  - agent: bfm_agent
+  - simulator: mujoco_simulator
+  - observation: bfm
+  - env: motion_tracking
+
+device: 'cuda'

@@ -1,0 +1,7 @@
+defaults:
+  - base_simulator
+
+_target_: scalebridge.simulator.real_world.RealWorld
+_recursive_: False
+config:
+  joystick: False

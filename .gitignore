@@ -22,6 +22,9 @@ tmp/
 
 assets/
 third_party/
+# The deploy module vendors its own assets and LCM type stubs.
+!deploy/assets/
+!deploy/third_party/
 
 # Local HuggingFace weights used by the frozen text encoder presets.
 reactivebfm/model/text_encoder/distilbert-base-uncased/

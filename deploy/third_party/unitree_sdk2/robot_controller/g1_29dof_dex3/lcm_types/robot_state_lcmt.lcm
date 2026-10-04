@@ -1,0 +1,27 @@
+struct robot_state_lcmt
+{
+    float quat[4];
+    float rpy[3];
+    float aBody[3];
+    float omegaBody[3];
+    float p[3];
+    float vBody[3];
+
+    float q[43];
+    float qd[43];
+    float tau_est[43];
+
+    float lquat[4];
+    float lrpy[3];
+    float laBody[3];
+    float lomegaBody[3];
+    float lpressure[9][12];
+
+    float rquat[4];
+    float rrpy[3];
+    float raBody[3];
+    float romegaBody[3];
+    float rpressure[9][12];
+    
+    int64_t timestamp_us;
+}

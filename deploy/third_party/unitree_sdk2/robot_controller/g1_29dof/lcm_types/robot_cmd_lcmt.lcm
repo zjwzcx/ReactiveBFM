@@ -1,0 +1,10 @@
+struct robot_cmd_lcmt
+{
+    double q_des[29];
+    double qd_des[29];
+    double tau_ff[29];
+    double kp[29];
+    double kd[29];
+    int64_t timestamp_us;
+    double se_contactState[2];
+}

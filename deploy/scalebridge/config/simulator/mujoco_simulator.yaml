@@ -1,0 +1,17 @@
+defaults:
+  - base_simulator
+
+_target_: scalebridge.simulator.mujoco_simulator.MujocoSimulator
+_recursive_: False
+config:
+  record_video: False
+  video_path: null
+  render_width: 640
+  render_height: 480
+  video_text: ""
+  video_total_frames: 0
+  video_font_size: 20
+  headless: False
+  marker: True
+  joystick: False
+  camera_follow: True

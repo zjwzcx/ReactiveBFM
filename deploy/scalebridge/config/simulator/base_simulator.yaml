@@ -1,0 +1,8 @@
+# Base Simulator Config File
+
+_target_: scalebridge.simulator.base_simulator.BaseSimulator
+_recursive_: False
+config:
+  asset: ${asset}
+  low_dt: 0.005
+  decimation: 4

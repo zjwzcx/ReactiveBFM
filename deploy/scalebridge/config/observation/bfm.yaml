@@ -1,0 +1,49 @@
+
+root_quat_buffer:
+  func:
+    _target_: scalebridge.observation.components.root_quat_buffer
+    _partial_: true
+root_pos:
+  func:
+    _target_: scalebridge.observation.components.root_pos
+    _partial_: true
+base_ang_vel_buffer:
+  func:
+    _target_: scalebridge.observation.components.base_ang_vel_buffer
+    _partial_: true
+dof_pos_buffer:
+  func:
+    _target_: scalebridge.observation.components.dof_pos_buffer
+    _partial_: true
+dof_vel_buffer:
+  func:
+    _target_: scalebridge.observation.components.dof_vel_buffer
+    _partial_: true
+actions_buffer:
+  func:
+    _target_: scalebridge.observation.components.actions_buffer
+    _partial_: true
+# body_pos_w_future:
+#   func:
+#     _target_: scalebridge.observation.components.body_pos_w_future
+#     _partial_: true
+# body_quat_w_future:
+#   func:
+#     _target_: scalebridge.observation.components.body_quat_w_future
+#     _partial_: true
+ref_root_pos_future:
+  func:
+    _target_: scalebridge.observation.components.ref_root_pos_future
+    _partial_: true
+ref_root_rot_future:
+  func:
+    _target_: scalebridge.observation.components.ref_root_rot_future
+    _partial_: true
+ref_dof_pos_future:
+  func:
+    _target_: scalebridge.observation.components.ref_dof_pos_future
+    _partial_: true
+future_time_offsets:
+  func:
+    _target_: scalebridge.observation.components.future_time_offsets
+    _partial_: true

@@ -1,0 +1,30 @@
+
+xml_path: scalebridge/data/robot/g1_29dof/g1_29dof.xml
+
+rc_decoder:
+  _target_: third_party.unitree_sdk2.robot_controller.remote_controller.lcm_types.rc_command_lcmt.rc_command_lcmt
+
+state_decoder:
+  _target_: third_party.unitree_sdk2.robot_controller.g1_29dof.lcm_types.robot_state_lcmt.robot_state_lcmt
+
+command_encoder:
+  _target_: third_party.unitree_sdk2.robot_controller.g1_29dof.lcm_types.robot_cmd_lcmt.robot_cmd_lcmt
+
+localization_module:
+  _target_: scalebridge.utils.vive_tracker.online_client.ViveTrackerOnlineClient
+  host: 0.0.0.0
+  port: 5000
+
+real_joint_names: [
+    "left_hip_pitch_joint", "left_hip_roll_joint", "left_hip_yaw_joint",
+    "left_knee_joint", "left_ankle_pitch_joint", "left_ankle_roll_joint",
+    "right_hip_pitch_joint", "right_hip_roll_joint", "right_hip_yaw_joint",
+    "right_knee_joint", "right_ankle_pitch_joint", "right_ankle_roll_joint",
+    "waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint",
+    "left_shoulder_pitch_joint", "left_shoulder_roll_joint", "left_shoulder_yaw_joint",
+    "left_elbow_joint", "left_wrist_roll_joint", "left_wrist_pitch_joint", "left_wrist_yaw_joint",
+    "right_shoulder_pitch_joint", "right_shoulder_roll_joint", "right_shoulder_yaw_joint",
+    "right_elbow_joint", "right_wrist_roll_joint", "right_wrist_pitch_joint", "right_wrist_yaw_joint",
+]
+
+root_height: 0.76

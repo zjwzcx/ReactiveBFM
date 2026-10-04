@@ -1,0 +1,47 @@
+defaults:
+  - base_env
+
+_target_: scalebridge.env.motion_tracking_xsens.MotionTrackingXsensEnv
+_recursive_: False
+config:
+  future_idx: [0, 1, 2, 3, 4, 10]
+  xsens_port: 9763
+  xsens_host: "0.0.0.0"
+  xsens_scale_factor: 0.75
+
+  has_hand: False
+  hand_type: dex3
+  hand_joint_names: [
+    "left_hand_thumb_0", "left_hand_thumb_1", "left_hand_thumb_2",
+    "left_hand_middle_0", "left_hand_middle_1",
+    "left_hand_index_0", "left_hand_index_1",
+    "right_hand_thumb_0", "right_hand_thumb_1", "right_hand_thumb_2",
+    "right_hand_middle_0", "right_hand_middle_1",
+    "right_hand_index_0", "right_hand_index_1"
+  ]
+  hand_stiffness: [
+    0.5, 0.5, 0.5,
+    0.5, 0.5,
+    0.5, 0.5,
+    0.5, 0.5, 0.5,
+    0.5, 0.5,
+    0.5, 0.5
+  ]
+  hand_damping: [
+    0.1, 0.1, 0.1,
+    0.1, 0.1,
+    0.1, 0.1,
+    0.1, 0.1, 0.1,
+    0.1, 0.1,
+    0.1, 0.1
+  ]
+  hand_torque_limit: [
+    2.45, 0.7, 0.7,
+    0.7, 0.7, 
+    0.7, 0.7, 
+    2.45, 0.7, 0.7,
+    0.7, 0.7,
+    0.7, 0.7
+  ]
+
+  reference_forcing: True
