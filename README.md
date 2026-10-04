@@ -82,7 +82,7 @@ export WANDB_ENTITY=<your_wandb_username>   # optional; omit to use your wandb l
 ReactiveBFM/
 ├── README.md
 ├── pyproject.toml
-├── deploy/            # planned: deployment stack, to be released later
+├── deploy/            # deployment stack (online runner + ScaleBridge tracking layer)
 └── reactivebfm/
     ├── data/       # datasets, collators, registries, HumanML utilities
     ├── model/      # DiT motion planner and frozen text encoders
@@ -136,6 +136,15 @@ registered in the dataset registry.
 
 For a standalone teacher-forcing baseline, use
 `reactivebfm.train.train_planner_teacher_forcing` with `--num_steps 1000000`.
+
+
+## Deployment
+
+The `deploy/` directory contains the Unitree G1 deployment stack: an online
+runner that closes the loop between the ReactiveBFM planner and the ScaleBFM
+tracking policy (MuJoCo Sim2Sim and Unitree LCM Sim2Real), plus the ScaleBridge
+tracking layer. See [`deploy/README.md`](deploy/README.md) for setup,
+interfaces, and launch commands.
 
 
 ## TODO List
