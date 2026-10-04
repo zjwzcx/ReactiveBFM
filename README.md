@@ -76,7 +76,7 @@ export WANDB_ENTITY=<your_wandb_username>   # optional; omit to use your wandb l
 ```
 
 
-## Structure
+## 📁 Structure
 
 ```text
 ReactiveBFM/
@@ -92,23 +92,23 @@ ReactiveBFM/
 ```
 
 
-## Data Preparation
+## 📊 Data Preparation
 
-The full train/val/test data is publicly available on
-[Google Drive](https://drive.google.com/drive/folders/1cGUKce0g1lSTkebFhKxEFaDuytIeA5P0?usp=sharing).
+The full train/val/test data is available on
+[Google Drive](https://drive.google.com/drive/folders/1cGUKce0g1lSTkebFhKxEFaDuytIeA5P0?usp=sharing),
+including our re-made G1 corpus built from [AMASS](https://amass.is.tue.mpg.de/)
+motions with [HumanML3D](https://github.com/EricGuo5513/HumanML3D) text
+annotations, the [100STYLE](https://ianxmason.github.io/100style/) dataset, and
+the [KungfuBot](https://github.com/TeleHuman/PBHC) dataset.
 
-The public recipes use the **36-dimensional G1 motion representation** and
-captioned motion clips. Dataset paths are registered in
-`reactivebfm/data/datasets/registry.py`; multiple registered datasets can be
-combined with a comma-separated `--dataset` argument. Large datasets remain
-outside the repository and are supplied with `--data_dir` when needed.
-
-The complete data contract—frame layout, joint order, coordinate conventions,
-normalization files, split files, and dataset directory examples—is documented
+To customize your own dataset, register it in
+`reactivebfm/data/datasets/registry.py` and combine registered names with a
+comma-separated `--dataset` argument. The complete data contract—frame layout,
+joint order, normalization files, splits, and directory examples—is documented
 in [`reactivebfm/data/README.md`](reactivebfm/data/README.md).
 
 
-## Training
+## 🏋️ Training
 
 The scheduled-forcing entrypoint handles both stages in one run: it uses pure
 teacher forcing for the first 400k steps, then ramps three-primitive
@@ -119,7 +119,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 torchrun --standalone --nnodes=1 --nproc_per_node=8 \
   -m reactivebfm.train.train_planner_scheduled_forcing \
   --save_dir save/reactivebfm_tf400k_sr3_1m_bs128x8 \
-  --dataset <reactivebfm_dataset> \
+  --dataset amass_100style_kungfu_g1_36dim \
   --model_type flow \
   --num_warmup_steps 400000 \
   --num_steps 1000000 \
@@ -130,29 +130,38 @@ torchrun --standalone --nnodes=1 --nproc_per_node=8 \
 - `--cross_prob` defaults to `0`. To learn streaming instruction transitions,
   use `--cross_prob 0.1`.
 
-Replace `<reactivebfm_dataset>` with the recommended `reactivebfm_dataset`
-name, or customize it with any dataset name or comma-separated composition
-registered in the dataset registry.
+The default `amass_100style_kungfu_g1_36dim` is the registered full training
+set built from the three released data sources (AMASS/HumanML3D + 100STYLE +
+Kungfu). You can also pass any single registered name or a comma-separated
+composition (e.g. `amass_g1_36dim,100style_g1_36dim,kungfu_g1_36dim`).
 
 For a standalone teacher-forcing baseline, use
 `reactivebfm.train.train_planner_teacher_forcing` with `--num_steps 1000000`.
 
 
-## Deployment
+## 🤖 Deployment
 
-The `deploy/` directory contains the Unitree G1 deployment stack: an online
-runner that closes the loop between the ReactiveBFM planner and the ScaleBFM
-tracking policy (MuJoCo Sim2Sim and Unitree LCM Sim2Real), plus the ScaleBridge
-tracking layer. See [`deploy/README.md`](deploy/README.md) for setup,
-interfaces, and launch commands.
+```bash
+python deploy/run_online_generation.py \
+  --model_path /path/to/reactivebfm/modelXXXXXXXX.pt \
+  --policy_checkpoint /path/to/tracking_policy_tensorrt.pt \
+  --text_prompt "walk forward" \
+  --init_pose A_pose \
+  --simulator mujoco_simulator --headless
+```
+
+This closes the loop between the ReactiveBFM planner and the ScaleBFM tracking
+policy on the Unitree G1 (MuJoCo Sim2Sim; Unitree LCM for Sim2Real). Setup,
+TensorRT compilation, interfaces, prompt switching, and real-world deployment
+are documented in [`deploy/README.md`](deploy/README.md).
 
 
-## TODO List
+## 📝 TODO List
 
 - [x] Release the arXiv paper and project page in June, 2026.
 - [x] Release the training code in August, 2026.
 - [x] Release all training data in September, 2026.
-- [ ] Release the sim2sim evaluation and deployment code for Unitree G1 in September, 2026.
+- [x] Release the deployment code for Unitree G1 in September, 2026.
 
 
 ## 🔗 Citation
@@ -169,11 +178,19 @@ If you find our work helpful, please cite it:
 ```
 
 
-We acknowledge that our work references the code from the following awesome projects.
+We acknowledge that our work builds upon the following awesome projects.
 
-- [ScaleBFM](https://github.com/zengweishuai/ScaleBFM)
-- [CLoSD](https://github.com/GuyTevet/CLoSD)
-- [HumanML3D](https://github.com/EricGuo5513/HumanML3D)
+[ScaleBFM](https://github.com/zengweishuai/ScaleBFM) provides the deployment
+codebase and the tracking-policy checkpoint, and
+[CLoSD](https://github.com/GuyTevet/CLoSD) provides the earliest codebase of
+our motion planner. Our training data is built upon
+[AMASS](https://amass.is.tue.mpg.de/),
+[MotionMillion](https://arxiv.org/abs/2507.07095),
+[HumanML3D](https://github.com/EricGuo5513/HumanML3D),
+[KungfuBot](https://github.com/TeleHuman/PBHC),
+[100STYLE](https://ianxmason.github.io/100style/), and
+[PhysHSI](https://arxiv.org/abs/2510.11072), whose data sources and processing
+scripts we gratefully acknowledge.
 
 ## 📄 License
 <a rel="license" href="http://creativecommons.org/licenses/by-nc-sa/4.0/"><img alt="Creative Commons License" style="border-width:0" src="https://i.creativecommons.org/l/by-nc-sa/4.0/80x15.png" /></a>
